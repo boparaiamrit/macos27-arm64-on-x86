@@ -1,0 +1,34 @@
+diff --git a/qemu/hw/vmapple/vmapple.c b/qemu/hw/vmapple/vmapple.c
+index 9677aa4..2facdfe 100644
+--- a/qemu/hw/vmapple/vmapple.c
++++ b/qemu/hw/vmapple/vmapple.c
+@@ -719,6 +719,11 @@ static GlobalProperty vmapple_compat_defaults[] = {
+      * mapping in the XHCI controller works around the problem.
+      */
+     { TYPE_XHCI_PCI, "conditional-intr-mapping", "on" },
++    /*
++     * macOS 27's virtio PCI transport never starts a device whose
++     * capabilities are linked from high offsets to low.
++     */
++    { "virtio-net-pci-base", "x-ascending-capabilities", "on" },
+ };
+ 
+ static bool vmapple_get_gfx(Object *obj, Error **errp)
+@@ -799,8 +804,16 @@ static const TypeInfo vmapple_machine_info = {
+ static void apple_vm_machine_class_init(ObjectClass *oc, const void *data)
+ {
+     MachineClass *mc = MACHINE_CLASS(oc);
++    static GlobalProperty golden_net_defaults[] = {
++        { "virtio-net-pci-base", "x-ascending-capabilities", "on" },
++    };
++
++    /* machine_class_base_init() gives each concrete subclass a fresh
++     * compat_props array. Apply Golden Gate's network default here too. */
++    compat_props_add(mc->compat_props, golden_net_defaults,
++                     G_N_ELEMENTS(golden_net_defaults));
+ 
+-    /* Parent (vmapple) class_init has already run; override only the CPU. */
++    /* Parent (vmapple) class_init has already run; override the CPU. */
+     mc->default_cpu_type = TYPE_APPLE_VM_CPU;
+     mc->desc = "Apple aarch64 Virtual Machine (Orchard, custom CPU)";
+ }

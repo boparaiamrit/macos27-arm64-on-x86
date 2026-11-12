@@ -1,0 +1,255 @@
+--- /dev/null
++++ qualified/crates/reims-vgpu/tests/fixtures/mrt-order/fetch-one.frag
+@@ -0,0 +1,6 @@
++#version 450
++layout(location=0) flat in int primitive;
++layout(input_attachment_index=1,set=0,binding=193) uniform subpassInput input1;
++layout(location=0) out vec4 primary;
++layout(location=1) out vec4 secondary;
++void main(){ vec3 b=subpassLoad(input1).rgb;vec3 result=b*.5+.05*float(primitive+1);primary=vec4(result,1);secondary=vec4(result,1);}
+--- /dev/null
++++ qualified/crates/reims-vgpu/tests/fixtures/mrt-order/sample.frag
+@@ -0,0 +1,5 @@
++#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++layout(set=0,binding=1) uniform texture2D source_image;
++layout(location=0) out vec4 color;
++void main(){color=texelFetch(source_image,ivec2(gl_FragCoord.xy),0);}
+--- /dev/null
++++ qualified/crates/reims-vgpu/tests/fixtures/mrt-order/fetch-both.frag
+@@ -0,0 +1,7 @@
++#version 450
++layout(location=0) flat in int primitive;
++layout(input_attachment_index=0,set=0,binding=192) uniform subpassInput input0;
++layout(input_attachment_index=1,set=0,binding=193) uniform subpassInput input1;
++layout(location=0) out vec4 primary;
++layout(location=1) out vec4 secondary;
++void main(){ vec3 a=subpassLoad(input0).rgb,b=subpassLoad(input1).rgb; primary=vec4(a*.5+b*.25+.05,1);secondary=vec4(a*.25+b*.5+.1,1);}
+--- /dev/null
++++ qualified/crates/reims-vgpu/tests/fixtures/mrt-order/fetch.vert
+@@ -0,0 +1,3 @@
++#version 450
++layout(location=0) flat out int primitive;
++void main(){ vec2 p[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3));gl_Position=vec4(p[gl_VertexIndex%3],0,1);primitive=gl_VertexIndex/3; }
+--- /dev/null
++++ qualified/crates/reims-vgpu/tests/fixtures/mrt-order/fetch-overlap.frag
+@@ -0,0 +1,6 @@
++#version 450
++layout(location=0) flat in int primitive;
++layout(input_attachment_index=1,set=0,binding=193) uniform subpassInput input1;
++layout(location=0) out vec4 primary;
++layout(location=1) out vec4 secondary;
++void main(){ vec3 b=subpassLoad(input1).rgb;vec3 result=b*.5+.05*float(primitive+1);primary=vec4(result,1);secondary=vec4(result,1);}
+--- /dev/null
++++ qualified/crates/reims-vgpu/tests/fixtures/mrt-order/fetch-seven.frag
+@@ -0,0 +1,6 @@
++#version 450
++layout(location=0) flat in int primitive;
++layout(input_attachment_index=7,set=0,binding=199) uniform subpassInput input1;
++layout(location=0) out vec4 primary;
++layout(location=7) out vec4 secondary;
++void main(){ vec3 b=subpassLoad(input1).rgb;vec3 result=b*.5+.05*float(primitive+1);primary=vec4(result,1);secondary=vec4(result,1);}
+--- /dev/null
++++ qualified/crates/reims-vgpu/tests/mrt_order_gpu.rs
+@@ -0,0 +1,201 @@
++// Authored actual-engine oracles. A Vulkan init/draw/readback failure is a failure.
++fn mrt_order_words(name: &str) -> Vec<u32> {
++    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
++        .join("tests/fixtures/mrt-order")
++        .join(name);
++    let bytes = std::fs::read(path).expect("authored qualified SPIR-V exists");
++    assert_eq!(bytes.len() % 4, 0);
++    bytes
++        .chunks_exact(4)
++        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
++        .collect()
++}
++fn mrt_order_identity(id: u64) -> TargetIdentity {
++    TargetIdentity::Gva {
++        gva: id * 0x10000,
++        width: 20,
++        height: 20,
++        generation: 1,
++        format: ash::vk::Format::R8G8B8A8_UNORM,
++    }
++}
++fn mrt_order_pixels(label: &str, px: &[u8], inside: [f32; 4], outside: [f32; 4]) {
++    assert_eq!(px.len(), 20 * 20 * 4, "{label}: exact readback length");
++    assert!(inside.iter().chain(outside.iter()).all(|v| v.is_finite()));
++    let mut max_error = 0.0f32;
++    for y in 0..20 {
++        for x in 0..20 {
++            let expected = if (2..18).contains(&x) && (2..18).contains(&y) {
++                inside
++            } else {
++                outside
++            };
++            for c in 0..4 {
++                let actual = px[(y * 20 + x) * 4 + c] as f32 / 255.0;
++                max_error = max_error.max((actual - expected[c]).abs());
++                assert!(
++                    (actual - expected[c]).abs() <= 3.0 / 255.0,
++                    "{label} x={x} y={y} channel={c} got={actual} expected={}",
++                    expected[c]
++                );
++            }
++        }
++    }
++    eprintln!("MRT_ORDER_PIXELS label={label} pixels=400 channels=1600 inner_pixels=256 guard_pixels=144 max_error={max_error} expected={inside:?} guard={outside:?}");
++}
++fn mrt_order_run(selected: &[u32], slot: usize, primitives: u32, label: &str, id: u64) {
++    let _guard = engine_test_session();
++    let v = mrt_order_words("fetch.vert.spv");
++    let f = mrt_order_words(&format!("fetch-{label}.frag.spv"));
++    let seed0 = [0.2f32, 0.4, 0.6, 1.0];
++    let seed1 = [0.8f32, 0.3, 0.1, 1.0];
++    let mut req = engine_req(&v, &f, 20, 20);
++    req.target_identity = Some(mrt_order_identity(id));
++    req.color_attachment = Some(color_attachment(
++        reims_vgpu::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM,
++        seed0.map(f64::from),
++    ));
++    req.color_input = engine::ColorInputs::parse(selected.iter().copied()).unwrap();
++    req.vertex_count = 3 * primitives;
++    req.scissors.push(ScissorResource {
++        x: 2,
++        y: 2,
++        width: 16,
++        height: 16,
++    });
++    for i in 1..=slot {
++        let clear = if i == slot {
++            seed1
++        } else {
++            [0.05, 0.15, 0.25, 1.0]
++        };
++        req.secondary_targets.push(SecondaryColorTarget {
++            identity: mrt_order_identity(id + i as u64),
++            width: 20,
++            height: 20,
++            attachment: color_attachment(
++                reims_vgpu::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM,
++                clear.map(f64::from),
++            ),
++            load: false,
++            blend: None,
++            color_write_mask: Default::default(),
++        });
++    }
++    let output = engine::execute_draw_request(engine_device(), &req)
++        .expect("required indexed ordered engine draw");
++    assert!(
++        engine::test_ordered_color_attachment_access_active(),
++        "actual created device enabled EXT color ordering"
++    );
++    let mut expected0 = seed0;
++    let mut expected1 = seed1;
++    for primitive in 0..primitives {
++        let old0 = expected0;
++        let old1 = expected1;
++        for c in 0..3 {
++            if selected == [0, 1] {
++                expected0[c] = old0[c] * 0.5 + old1[c] * 0.25 + 0.05;
++                expected1[c] = old0[c] * 0.25 + old1[c] * 0.5 + 0.1;
++            } else {
++                expected0[c] = old1[c] * 0.5 + 0.05 * (primitive + 1) as f32;
++                expected1[c] = expected0[c];
++            }
++            // Each primitive stores UNORM8; account for that quantization.
++            expected0[c] = (expected0[c] * 255.0).round() / 255.0;
++            expected1[c] = (expected1[c] * 255.0).round() / 255.0;
++        }
++    }
++    assert!((expected0[0] - seed0[0]).abs() > 0.02);
++    assert!((expected1[0] - seed1[0]).abs() > 0.02);
++    mrt_order_pixels(label, &semantic_rgba(&output), expected0, seed0);
++    let secondary = req.secondary_targets[slot - 1].identity.clone();
++    assert!(
++        engine::resident_content_ready(&secondary),
++        "secondary published after actual draw"
++    );
++    let sf = mrt_order_words("sample.frag.spv");
++    let mut sample = engine_req(&v, &sf, 20, 20);
++    sample.target_identity = Some(mrt_order_identity(id + 20));
++    sample.sampled_images.push(SampledImageResource {
++        binding: 1,
++        array_element: 0,
++        descriptor_count: 1,
++        width: 20,
++        height: 20,
++        layers: 1,
++        kind: reims_vgpu_core::texture_shape::TextureKind::D2,
++        multisampled: false,
++        source: SampledSource::Target(secondary.clone()),
++        byte_origin: Default::default(),
++        format: ash::vk::Format::R8G8B8A8_UNORM,
++        identity: None,
++        swizzle: Default::default(),
++    });
++    let before = engine::counter_snapshot();
++    let sampled = engine::execute_draw_request(engine_device(), &sample)
++        .expect("actual subsequent secondary sampling");
++    let delta = engine::counter_snapshot().delta_since(&before);
++    assert_eq!(delta.sampled_gpu_binds, 1);
++    assert_eq!(delta.sampled_reuploads, 0);
++    mrt_order_pixels(
++        &format!("{label}-secondary-sampled"),
++        &semantic_rgba(&sampled),
++        expected1,
++        seed1,
++    );
++    // Re-enter with real secondary LOAD, preserving the resident generation.
++    req.secondary_targets[slot - 1].load = true;
++    req.load_from_target = true;
++    engine::execute_draw_request(engine_device(), &req)
++        .expect("ready secondary LOAD survives sampling and re-entry");
++    assert!(engine::resident_content_ready(&secondary));
++    eprintln!("MRT_ORDER_EXECUTED label={label} inputs={selected:?} primitives_single_draw={primitives} secondary_slot={slot} ready_load_executed=true");
++}
++#[test]
++fn mrt_order_gpu_attachment1() {
++    mrt_order_run(&[1], 1, 1, "one", 0xa00);
++}
++#[test]
++fn mrt_order_gpu_both_distinct_seeds() {
++    mrt_order_run(&[0, 1], 1, 1, "both", 0xb00);
++}
++#[test]
++fn mrt_order_gpu_sparse_high7() {
++    mrt_order_run(&[7], 7, 1, "seven", 0xc00);
++}
++#[test]
++fn mrt_order_gpu_overlapping_primitives_single_draw() {
++    mrt_order_run(&[1], 1, 2, "overlap", 0xd00);
++}
++#[test]
++fn mrt_order_gpu_secondary_load_without_content_refused() {
++    let _guard = engine_test_session();
++    let v = mrt_order_words("fetch.vert.spv");
++    let f = mrt_order_words("fetch-one.frag.spv");
++    let mut req = engine_req(&v, &f, 20, 20);
++    req.target_identity = Some(mrt_order_identity(0xe00));
++    req.color_input = engine::ColorInputs::parse([1]).unwrap();
++    req.secondary_targets.push(SecondaryColorTarget {
++        identity: mrt_order_identity(0xe01),
++        width: 20,
++        height: 20,
++        attachment: color_attachment(
++            reims_vgpu::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM,
++            [0.8, 0.3, 0.1, 1.0],
++        ),
++        load: true,
++        blend: None,
++        color_write_mask: Default::default(),
++    });
++    let error =
++        engine::execute_draw_request(engine_device(), &req).expect_err("unready LOAD must refuse");
++    assert!(
++        error
++            .to_string()
++            .contains("load_secondary_content_not_ready"),
++        "typed readiness refusal: {error}"
++    );
++    assert!(!engine::resident_content_ready(&mrt_order_identity(0xe01)));
++    eprintln!("MRT_ORDER_LOAD_REFUSAL {error}");
++}

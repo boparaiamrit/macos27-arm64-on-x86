@@ -1,0 +1,11 @@
+Proposed change for review: support documented APFS headerless B-tree nodes in apfs-tools/src/fs_explorer/filesystems/apfs/fs.py, container.py and btree.py, with focused regression fixtures.
+
+APFSVolume._fs_node must carry explicit object-map/node format information into loading and parsing. Headerless nodes must satisfy the required node/tree flags and zero-header structure. Ordinary objects retain Fletcher checksum validation. BNode must accept the documented headerless representation instead of requiring an object type inside a zero header. Bounds, contradictory flags, malformed records, bad normal-object checksums and applicable sealed-tree hash failures must continue to fail closed. Suppressing CorruptDataError or skipping /p2/v1 is not an acceptable fix.
+
+Regression coverage should reproduce headerless root/leaf rejection, retain rejection of corrupt normal metadata and malformed headerless nodes, and exercise a known sealed tree through inode/directory lookup. Sealed-tree hash/integrity behavior must be explicitly reviewed before a completion claim. The existing real restore fixture should then verify the normal path.
+
+After authorization and validation, a live retry must use reviewed bounded preparation orchestration with the original 10 GiB floor, 20-second sample freshness, network-none preparation and owned cleanup. No change is proposed to OCI/ASIF mapping, backend fetching, firmware bytes or guest execution.
+
+The current wrapper admits readiness only until 3,700 seconds after the existing server started. This backend started at 2026-10-27T13:21:12.274Z; the cutoff is 2026-10-27T14:22:52.274Z (19:52:52 IST). After that cutoff, the current wrapper refuses entry even though export readiness was previously reached. Any reinitialization or ready-backend continuation needs a separate reviewed decision. This investigation changes neither the wrapper nor the backend.
+
+The user's original instruction expressly prohibits reader edits and restarts. Required scope expansion: authorize the focused APFS reader implementation and its validation, followed by a reviewed guarded preparation attempt. Firmware patching, QEMU/VM/GUI work, full RAW conversion and host cleanup remain outside this step.

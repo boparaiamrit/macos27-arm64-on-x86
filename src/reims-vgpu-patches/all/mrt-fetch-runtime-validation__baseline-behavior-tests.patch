@@ -1,0 +1,43 @@
+--- baseline/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
++++ fixture/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+@@ -4502,3 +4502,16 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod mrt_order_baseline_layout {
++    use super::*;
++    #[test]
++    fn mrt_order_baseline_selected_secondary_requires_general_layout() {
++        let mut key = PassKey::single(Color0Load::Clear, vk::Format::R8G8B8A8_UNORM);
++        key.secondary_count = 1;
++        key.color_input = true;
++        assert_eq!(key.color_layout(1), vk::ImageLayout::GENERAL,
++            "selected input attachment 1 must use its own input-compatible layout");
++    }
++}
+--- baseline/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ fixture/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -8591,3 +8591,21 @@
+         assert_eq!(checked, COMPARES.len() * OPS.len() * 2);
+     }
+ }
++
++#[cfg(test)]
++mod mrt_order_baseline_descriptor {
++    use super::*;
++    #[test]
++    fn mrt_order_baseline_selected_secondary_requires_binding_193() {
++        let mut out = Vec::new();
++        fill_descriptor_bindings(&mut out, &[], &[], &[],
++            Some((vk::ImageView::null(), vk::ImageLayout::GENERAL)));
++        let indices: Vec<_> = out.iter().filter_map(|b| match b {
++            super::super::pools::PushDescriptorBinding::Image {binding,ty,..}
++                if *ty == vk::DescriptorType::INPUT_ATTACHMENT => Some(*binding),
++            _ => None,
++        }).collect();
++        assert_eq!(indices, vec![super::super::types::COLOR_INPUT_BINDING + 1],
++            "fetch of secondary attachment 1 must bind 192+1, never attachment 0");
++    }
++}

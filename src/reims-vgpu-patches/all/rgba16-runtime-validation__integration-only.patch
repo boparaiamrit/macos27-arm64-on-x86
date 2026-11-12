@@ -1,0 +1,304 @@
+--- baseline/vulkan.rs
++++ qualified/vulkan.rs
+@@ -14995,3 +14995,7 @@
+ #[cfg(test)]
+ #[path = "rgb10_runtime_tests.rs"]
+ mod rgb10_runtime_tests;
++
++#[cfg(test)]
++#[path = "rgba16_runtime_tests.rs"]
++mod rgba16_runtime_tests;
+--- /dev/null
++++ qualified/rgba16_runtime_tests.rs
+@@ -0,0 +1,291 @@
++//! Actual-loader qualification. No converter or guest execution lives here.
++use super::*;
++use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
++use crate::protocol::endian::{st32, st64};
++use crate::runtime::decode::resource::{
++    list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,
++};
++use crate::runtime::gva_mem::{define_task_pages_arm64e, write_task_gva_arm64e};
++use crate::runtime::host::FakeHost;
++use crate::runtime::writeback_debt::test_resident_identity;
++
++const GVA: u64 = 5 << RESOURCE_PAGE_SHIFT;
++
++struct Rig {
++    state: DeviceState,
++    host: FakeHost,
++    bt: BufferTextureDescriptor,
++    source: Vec<u8>,
++    expected: Vec<u8>,
++    w: usize,
++    h: usize,
++    pitch: usize,
++    offset: usize,
++    span: usize,
++}
++
++impl Rig {
++    fn new(w: usize, h: usize, pitch: usize, offset: usize, short: bool) -> Self {
++        let span = (h - 1) * pitch + w * 8;
++        let alloc = offset + pitch * h + 64;
++        let mut host = FakeHost::new();
++        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++        let pages = ((GVA as usize + alloc + 16383) / 16384) as u32;
++        define_task_pages_arm64e(&mut host, &mut state, 4, pages);
++        assert!(state.set_object_list(1, 0, 64));
++        let mut source = vec![0xA7; alloc];
++        let mut expected = Vec::with_capacity(w * h * 8);
++        // Adjacent pairs at zero, midpoint, and maximum in EVERY channel.
++        // Values 65534/65535 must remain distinct; half output would lose them.
++        let pairs: [[u16; 2]; 4] = [[0, 1], [2, 3], [32767, 32768], [65534, 65535]];
++        for y in 0..h {
++            for x in 0..w {
++                for c in 0..4 {
++                    let value = pairs[(y + c) % 4][x % 2].to_le_bytes();
++                    let p = offset + y * pitch + x * 8 + c * 2;
++                    source[p..p + 2].copy_from_slice(&value);
++                    expected.extend_from_slice(&value);
++                }
++            }
++        }
++        write_task_gva_arm64e(&mut host, &state.tasks[1], GVA, &source);
++        let mut bdesc = [0u8; 16];
++        st64(
++            &mut bdesc,
++            if short {
++                (offset + span - 1) as u64
++            } else {
++                alloc as u64
++            },
++        );
++        st32(&mut bdesc[8..], 5);
++        write_task_gva_arm64e(&mut host, &state.tasks[1], 0x1000, &bdesc);
++        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
++        st32(&mut entry, u32::from(OBJECT_TYPE_BUFFER) | (16 << 8));
++        st64(&mut entry[4..], 0x1000);
++        write_task_gva_arm64e(
++            &mut host,
++            &state.tasks[1],
++            list_object_entry_offset(32, 64).unwrap(),
++            &entry,
++        );
++        let bt = BufferTextureDescriptor {
++            new_texture_ref: 31,
++            buffer_ref: 32,
++            offset: offset as u64,
++            bytes_per_row: pitch as u64,
++            desc: crate::runtime::heap_query::TextureDescriptor {
++                texture_type: 2,
++                framebuffer_only: false,
++                is_drawable: false,
++                allow_gpu_optimized_contents: false,
++                usage: 1,
++                pixel_format: 0x6e,
++                width: w as u32,
++                height: h as u32,
++                depth: 1,
++                mipmap_level_count: 1,
++                sample_count: 1,
++                array_length: 1,
++                resource_options: 0,
++                protection_options: 0,
++                swizzle: None,
++            },
++        };
++        Self {
++            state,
++            host,
++            bt,
++            source,
++            expected,
++            w,
++            h,
++            pitch,
++            offset,
++            span,
++        }
++    }
++    fn odd(short: bool) -> Self {
++        Self::new(17, 9, 160, 48, short)
++    }
++    fn load(&mut self) -> Option<(u32, u32, Vec<u8>, SampledByteFormat)> {
++        load_buffer_texture_upload(&mut self.state, &mut self.host, 1, 31, &self.bt)
++    }
++    fn arm(&mut self, id: u32) {
++        assert_eq!(
++            self.state
++                .pending_writebacks
++                .arm(id, test_resident_identity(id, 32, 32, 1), 32, 32, 1),
++            None
++        );
++    }
++    fn source_now(&self) -> Vec<u8> {
++        let mut bytes = vec![0; self.source.len()];
++        gva_mem::read_task_gva_by_id(
++            &self.host,
++            &self.state.tasks,
++            1,
++            GVA,
++            &mut bytes,
++            PAGE_SHIFT_ARM64E,
++        )
++        .unwrap();
++        bytes
++    }
++    fn verify_emit(mut self, case: &str) {
++        let _cap = TestBufferTextureCapability::set(true);
++        let saved = crate::runtime::drain::store_route_count("cpu_buffer_extent_saved_bytes");
++        let (w, h, bytes, format) = self
++            .load()
++            .expect("actual loader must accept native RGBA16");
++        assert_eq!((w, h), (self.w as u32, self.h as u32));
++        assert_eq!(
++            format,
++            SampledByteFormat::from_source(TexelLayout::Rgba16Unorm, 0x6e)
++        );
++        assert_eq!(bytes.len(), self.w * self.h * 8);
++        assert_eq!(bytes, self.expected);
++        assert_eq!(
++            self.source_now(),
++            self.source,
++            "all prefix, rowpadding and tail guards remain unchanged"
++        );
++        assert_eq!(
++            crate::runtime::drain::store_route_count("cpu_buffer_extent_saved_bytes") - saved,
++            (self.source.len() - self.offset - self.span) as u64,
++            "actual read excludes final padding and tail"
++        );
++        std::fs::write(format!("/out/runtime-{case}-native.bin"), &bytes).unwrap();
++        std::fs::write(
++            format!("/out/runtime-{case}-source-before.bin"),
++            &self.source,
++        )
++        .unwrap();
++        std::fs::write(
++            format!("/out/runtime-{case}-source-after.bin"),
++            self.source_now(),
++        )
++        .unwrap();
++        std::fs::write(format!("/out/runtime-{case}-geometry.json"),format!(
++            "{{\"width\":{w},\"height\":{h},\"source_pitch\":{},\"source_offset\":{},\"read_span\":{},\"allocation\":{},\"native_bytes\":{},\"source_ordinal\":110,\"bytes_per_texel\":8,\"format\":\"R16G16B16A16_UNORM\",\"producer\":\"actual load_buffer_texture_upload\",\"source_guards\":true,\"output_owned\":true}}\n",
++            self.pitch,self.offset,self.span,self.source.len(),bytes.len())).unwrap();
++        let overwrite = vec![0xD9; self.source.len()];
++        write_task_gva_arm64e(&mut self.host, &self.state.tasks[1], GVA, &overwrite);
++        assert_eq!(
++            bytes, self.expected,
++            "returned upload owns data after guest overwrite"
++        );
++        assert_eq!(self.source_now(), overwrite);
++    }
++}
++
++#[test]
++fn rgba16_actual_runtime_native_384_pitch3072() {
++    Rig::new(384, 384, 3072, 0, false).verify_emit("384");
++}
++#[test]
++fn rgba16_actual_runtime_native_odd_padded_offset() {
++    Rig::odd(false).verify_emit("odd");
++}
++
++#[test]
++fn rgba16_actual_runtime_short_allocation_terminal_refusal() {
++    let _cap = TestBufferTextureCapability::set(true);
++    let mut rig = Rig::odd(true);
++    rig.arm(31);
++    rig.arm(32);
++    let capture = crate::observe::FailCapture::start();
++    assert!(rig.load().is_none());
++    assert!(capture
++        .lines()
++        .iter()
++        .any(|x| x.contains("reason=buftex_native_source_range")));
++    assert!(rig.state.pending_writebacks.get(31).is_none());
++    assert!(
++        rig.state.pending_writebacks.get(32).is_some(),
++        "short allocation never reads backing"
++    );
++    assert_eq!(rig.source_now(), rig.source);
++}
++
++#[test]
++fn rgba16_actual_runtime_unsupported_capability_terminal_refusal() {
++    let _cap = TestBufferTextureCapability::set(false);
++    let mut rig = Rig::odd(false);
++    rig.arm(31);
++    rig.arm(32);
++    let capture = crate::observe::FailCapture::start();
++    assert!(rig.load().is_none());
++    assert!(capture
++        .lines()
++        .iter()
++        .any(|x| x.contains("reason=buftex_native_host_sampled_layout")));
++    assert!(rig.state.pending_writebacks.get(31).is_some());
++    assert!(rig.state.pending_writebacks.get(32).is_some());
++    assert_eq!(rig.source_now(), rig.source);
++}
++
++#[test]
++fn rgba16_actual_runtime_both_debts_generation_refusal_and_census() {
++    let _cap = TestBufferTextureCapability::set(true);
++    let count = crate::runtime::drain::store_route_count;
++    let before = count("wbdebt_generation_moved");
++    let census = count("wbdebt_reach_disjoint");
++    for _ in 0..64 {
++        let mut rig = Rig::odd(false);
++        rig.arm(31);
++        rig.arm(32);
++        rig.arm(63);
++        assert!(!crate::backend::vulkan::engine::guest_writes_outstanding());
++        assert_eq!(rig.load().unwrap().2, rig.expected);
++        assert!(rig.state.pending_writebacks.get(31).is_none());
++        assert!(rig.state.pending_writebacks.get(32).is_none());
++        assert!(rig.state.pending_writebacks.get(63).is_some());
++        assert_eq!(
++            rig.source_now(),
++            rig.source,
++            "generation-refused debts cannot overwrite current guest bytes"
++        );
++    }
++    assert_eq!(count("wbdebt_generation_moved") - before, 128);
++    assert_eq!(count("wbdebt_reach_disjoint") - census, 1);
++}
++
++#[test]
++fn rgba16_actual_runtime_missing_source_does_not_serve_previous_upload() {
++    let _cap = TestBufferTextureCapability::set(true);
++    let mut rig = Rig::odd(false);
++    let first = rig.load().unwrap().2;
++    // Invalidate the real source PTE, keeping descriptor and object-list pages.
++    // A stale cached source/upload must never satisfy this second read.
++    rig.host
++        .write_gpa((3u64 << PAGE_SHIFT_ARM64E) + 5 * 4, &[0; 4])
++        .unwrap();
++    assert!(rig.load().is_none());
++    assert_eq!(
++        first, rig.expected,
++        "already returned owned output remains valid"
++    );
++}
++
++#[test]
++fn rgba16_actual_runtime_old_rgba8_path_remains_exact() {
++    let _cap = TestBufferTextureCapability::set(false);
++    let mut rig = Rig::odd(false);
++    rig.bt.desc.pixel_format = 70;
++    let (w, h, bytes, format) = rig.load().unwrap();
++    assert_eq!((w, h), (17, 9));
++    assert_eq!(
++        format,
++        SampledByteFormat::from_source(TexelLayout::Rgba8, 70)
++    );
++    let expected: Vec<u8> = (0..9)
++        .flat_map(|y| {
++            rig.source[48 + y * 160..48 + y * 160 + 17 * 4]
++                .iter()
++                .copied()
++        })
++        .collect();
++    assert_eq!(bytes, expected);
++    assert_eq!(rig.source_now(), rig.source);
++}

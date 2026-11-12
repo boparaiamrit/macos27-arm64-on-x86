@@ -1,0 +1,482 @@
+--- a/apfs-tools/src/fs_explorer/filesystems/apfs/btree.py
++++ b/apfs-tools/src/fs_explorer/filesystems/apfs/btree.py
+@@ -18,12 +18,15 @@
+ from __future__ import annotations
+ 
+ import bisect
++import hashlib
++import hmac
+ import struct
+ from collections.abc import Callable, Iterator
++from dataclasses import dataclass
+ from itertools import accumulate
+ from typing import Any
+ 
+-from ...errors import CorruptDataError
++from ...errors import CorruptDataError, UnsupportedFormatError
+ from ...io import cancel
+ 
+ OBJ = struct.Struct("<QQQII")        # o_cksum, o_oid, o_xid, o_type, o_subtype
+@@ -34,6 +37,7 @@
+ OBJ_VIRTUAL = 0x00000000
+ OBJ_EPHEMERAL = 0x80000000
+ OBJ_PHYSICAL = 0x40000000
++OBJ_NOHEADER = 0x20000000
+ OBJ_ENCRYPTED = 0x10000000
+ 
+ OBJECT_TYPE_NX_SUPERBLOCK = 0x01
+@@ -53,6 +57,9 @@
+ # bt_flags (btree_info_t)
+ BTREE_PHYSICAL = 0x10
+ BTREE_HASHED = 0x80
++BTREE_NOHEADER = 0x100
++BTREE_EPHEMERAL = 0x8
++BTREE_NONPERSISTENT = 0x20
+ 
+ _NODE = struct.Struct("<HHIHHHHHHHH")   # flags, level, nkeys, table_space(off,len), free_space, key/val free lists
+ _INFO = struct.Struct("<IIIIIIQQ")      # bt_flags, node_size, key_size, val_size, longest_key, longest_val, nkeys, nnodes
+@@ -63,6 +70,45 @@
+ 
+ MAX_DEPTH = 16
+ _M32 = 0xFFFFFFFF
++
++
++@dataclass(frozen=True)
++class NodeFormat:
++    """Explicit interpretation from the owning tree/OMAP, never inferred from zero bytes.
++
++    Headerless support is deliberately limited to hashed sealed fs trees. The
++    volume verifies the root against integrity metadata; BTree verifies each edge.
++    """
++
++    noheader: bool = False
++    hashed: bool = False
++    root: bool | None = None
++    level: int = -1
++    tree_type: int | None = None
++    node_size: int = 0
++    mapping_flags: int = 0
++    hash_type: int | None = None
++
++
++def hash_size(hash_type: int) -> int:
++    sizes = {1: 32, 2: 32, 3: 48, 4: 64}
++    if hash_type not in sizes:
++        raise UnsupportedFormatError("apfs", f"unsupported sealed-tree hash algorithm {hash_type}")
++    return sizes[hash_type]
++
++
++def verify_hash(data: bytes, hash_type: int, expected: bytes | memoryview, what: str) -> None:
++    """Hash the entire object, including the 32 zero header bytes and all padding."""
++    size = hash_size(hash_type)
++    if len(expected) != size:
++        raise CorruptDataError(f"apfs: {what}: invalid hash length")
++    algorithm = {1: "sha256", 2: "sha512_256", 3: "sha384", 4: "sha512"}[hash_type]
++    try:
++        actual = hashlib.new(algorithm, data).digest()
++    except ValueError as error:
++        raise UnsupportedFormatError("apfs", f"hash algorithm unavailable: {algorithm}") from error
++    if not hmac.compare_digest(actual, expected):
++        raise CorruptDataError(f"apfs: {what}: hash mismatch")
+ 
+ 
+ def fletcher64(data: bytes | bytearray | memoryview) -> int:
+@@ -122,16 +168,31 @@
+                  "info", "oid")
+ 
+     def __init__(self, data: bytes, keyfn: Callable[[memoryview], Any], fixed: tuple[int, int] | None,
+-                 what: str, oid: int = 0) -> None:
++                 what: str, oid: int = 0, *, context: NodeFormat = NodeFormat()) -> None:
+         self.data = data
+         self.oid = oid
+         size = len(data)
+         if size < OBJ_SIZE + _NODE.size:
+             raise CorruptDataError(f"apfs: {what}: node too small")
++        flags, level, nkeys, toff, tlen, *_ = _NODE.unpack_from(data, OBJ_SIZE)
++        if flags & ~0x1f or bool(flags & BTNODE_LEAF) != (level == 0):
++            raise CorruptDataError(f"apfs: {what}: invalid node flags/level")
++        if context.noheader and not context.hashed:
++            raise CorruptDataError(f"apfs: {what}: headerless node without sealed hash context")
++        if bool(flags & BTNODE_NOHEADER) != context.noheader or bool(flags & BTNODE_HASHED) != context.hashed:
++            raise CorruptDataError(f"apfs: {what}: node flags contradict tree format")
+         otype = OBJ.unpack_from(data, 0)[3] & OBJECT_TYPE_MASK
+-        if otype not in (OBJECT_TYPE_BTREE, OBJECT_TYPE_BTREE_NODE):
+-            raise CorruptDataError(f"apfs: {what}: not a B-tree node (type {otype:#x})")
+-        flags, level, nkeys, toff, tlen, *_ = _NODE.unpack_from(data, OBJ_SIZE)
++        if context.noheader:
++            if any(data[:OBJ_SIZE]):
++                raise CorruptDataError(f"apfs: {what}: nonzero header in headerless node")
++        elif otype != (OBJECT_TYPE_BTREE if flags & BTNODE_ROOT else OBJECT_TYPE_BTREE_NODE):
++            raise CorruptDataError(f"apfs: {what}: not a B-tree node of the required type ({otype:#x})")
++        if context.root is not None and bool(flags & BTNODE_ROOT) != context.root:
++            raise CorruptDataError(f"apfs: {what}: unexpected root flag")
++        if context.level >= 0 and level != context.level:
++            raise CorruptDataError(f"apfs: {what}: unexpected child level {level}, expected {context.level}")
++        if context.node_size and size != context.node_size:
++            raise CorruptDataError(f"apfs: {what}: node size contradicts tree")
+         self.flags = flags
+         self.level: int = level
+         self.nkeys = nkeys
+@@ -140,10 +201,20 @@
+         vend = size
+         if is_root:
+             vend -= INFO_SIZE
++            if vend < OBJ_SIZE + _NODE.size:
++                raise CorruptDataError(f"apfs: {what}: truncated root footer")
+             self.info = _INFO.unpack_from(data, size - INFO_SIZE)
++            treeflags, nodesize = self.info[:2]
++            if nodesize != size or bool(treeflags & BTREE_NOHEADER) != context.noheader or bool(treeflags & BTREE_HASHED) != context.hashed:
++                raise CorruptDataError(f"apfs: {what}: root footer contradicts node format/size")
++            if treeflags & (BTREE_EPHEMERAL | BTREE_NONPERSISTENT) or treeflags & ~0x1ff:
++                raise CorruptDataError(f"apfs: {what}: unsupported on-disk tree flags")
++            if context.tree_type is not None:
++                if bool(treeflags & BTREE_PHYSICAL) != bool(context.tree_type & OBJ_PHYSICAL):
++                    raise CorruptDataError(f"apfs: {what}: tree pointer storage contradicts superblock")
+         base = OBJ_SIZE + _NODE.size
+         kstart = base + toff + tlen
+-        if kstart > vend or level >= MAX_DEPTH:
++        if kstart > vend or level >= MAX_DEPTH or (level > 0 and not nkeys):
+             raise CorruptDataError(f"apfs: {what}: invalid node header")
+         self._kstart = kstart
+         self._vend = vend
+@@ -158,13 +229,31 @@
+                 raise CorruptDataError(f"apfs: {what}: fixed-size node in a variable-size tree")
+             ksz, vsz = fixed
+             if level > 0:
+-                vsz = 8
++                vsz = 72 if context.hashed else 8
+             for i in range(nkeys):
+                 k, v = _KV_FIXED.unpack_from(data, base + toff + i * 4)
+                 locs.append((k, ksz, v, vsz))
+         else:
+             for i in range(nkeys):
+                 locs.append(_KV_VAR.unpack_from(data, base + toff + i * 8))
++        # Check all locations even when keyfn has a native/batched fast path.
++        spans = []
++        for ko, kl, vo, vl in locs:
++            if not kl or ko + kl > vend - kstart or (vo != 0xffff and (vo > vend - kstart or vo < vl)):
++                raise CorruptDataError(f"apfs: {what}: key/value outside the node")
++            spans.append((kstart + ko, kstart + ko + kl))
++            if vo != 0xffff and vl:
++                spans.append((vend - vo, vend - vo + vl))
++            if level > 0:
++                minimum = 8 + hash_size(context.hash_type if context.hash_type is not None else 1) if context.hashed else 8
++                maximum = 72 if context.hashed else 8
++                # kvloc_t supplies the stored size. The hash field's 64 bytes
++                # are a maximum: compact records may omit its unused padding.
++                if vo == 0xffff or not minimum <= vl <= maximum:
++                    raise CorruptDataError(f"apfs: {what}: malformed index value length {vl}")
++        spans.sort()
++        if any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
++            raise CorruptDataError(f"apfs: {what}: overlapping records")
+         many = getattr(keyfn, "many", None)
+         if many is not None:
+             keys = many(data, kstart, vend, locs, what)
+@@ -175,6 +264,8 @@
+                 if ka + kl > vend or (vo != 0xFFFF and (vo > vend - kstart or vo < vl)):
+                     raise CorruptDataError(f"apfs: {what}: key/value outside the node")
+                 keys.append(keyfn(mv[ka:ka + kl]))
++        if any(a >= b for a, b in zip(keys, keys[1:])):
++            raise CorruptDataError(f"apfs: {what}: keys not strictly ordered")
+         self.keys = keys
+         self._locs = locs
+         self.fixed = fixedkv
+@@ -201,6 +292,8 @@
+         if v is None or len(v) < 8:
+             raise CorruptDataError("apfs: index entry without a child pointer")
+         child: int = _U64.unpack_from(v, 0)[0]
++        if not child:
++            raise CorruptDataError("apfs: invalid zero child object identifier")
+         return child
+ 
+ 
+@@ -211,9 +304,19 @@
+     the root oid, the key function and the fixed key/value sizes.
+     """
+ 
+-    def __init__(self, root: BNode, read_node: Callable[[int, int], BNode], what: str) -> None:
++    def __init__(self, root: BNode, read_node: Callable[[int, int], BNode], what: str, *,
++                 hash_type: int | None = None, root_hash: bytes | None = None) -> None:
+         if not root.flags & BTNODE_ROOT or root.info is None:
+             raise CorruptDataError(f"apfs: {what}: root node lacks the root flag")
++        hashed = bool(root.info[0] & BTREE_HASHED)
++        if ((hashed and (hash_type is None or root_hash is None))
++                or (not hashed and (hash_type is not None or root_hash is not None))):
++            raise CorruptDataError(f"apfs: {what}: missing or contradictory sealed hash context")
++        if hash_type is not None:
++            if root_hash is None:
++                raise CorruptDataError(f"apfs: {what}: missing root hash")
++            verify_hash(root.data, hash_type, root_hash, f"{what} root")
++        self.hash_type = hash_type
+         self.root = root
+         self.read_node = read_node
+         self.what = what
+@@ -221,8 +324,18 @@
+ 
+     def _child(self, node: BNode, i: int) -> BNode:
+         c = self.read_node(node.child(i), node.level - 1)
++        # Always check the current parent edge, including a loader cache hit.
++        if self.hash_type is not None:
++            v = node.val(i)
++            if v is None or not 8 + hash_size(self.hash_type) <= len(v) <= 72:
++                raise CorruptDataError(f"apfs: {self.what}: malformed hashed child value")
++            verify_hash(c.data, self.hash_type, v[8:8 + hash_size(self.hash_type)], f"{self.what} child")
+         if c.level != node.level - 1:
+             raise CorruptDataError(f"apfs: {self.what}: child level {c.level} under level {node.level}")
++        if c.flags & BTNODE_ROOT or len(c.data) != self.info[1]:
++            raise CorruptDataError(f"apfs: {self.what}: invalid child root flag/size")
++        if (c.flags ^ self.root.flags) & (BTNODE_NOHEADER | BTNODE_HASHED):
++            raise CorruptDataError(f"apfs: {self.what}: inconsistent child format")
+         return c
+ 
+     def lookup_le(self, key: Any) -> tuple[Any, memoryview, memoryview | None] | None:
+--- a/apfs-tools/src/fs_explorer/filesystems/apfs/container.py
++++ b/apfs-tools/src/fs_explorer/filesystems/apfs/container.py
+@@ -23,6 +23,7 @@
+     OBJECT_TYPE_MASK,
+     OBJECT_TYPE_NX_SUPERBLOCK,
+     BNode,
++    NodeFormat,
+     check_object,
+     checksum_ok,
+ )
+@@ -128,18 +129,28 @@
+         return self.read_blocks(paddr, 1)
+ 
+     def load_node(self, paddr: int, keyfn: Callable[[memoryview], Any], fixed: tuple[int, int] | None, what: str,
+-                  decrypt: Callable[[bytes, int], bytes] | None = None, size: int = 0, oid: int = 0) -> BNode:
++                  decrypt: Callable[[bytes, int], bytes] | None = None, size: int = 0, oid: int = 0, *,
++                  context: NodeFormat = NodeFormat(), decrypt_context: Any = None) -> BNode:
+         """Read, decrypt, verify and parse a B-tree node at ``paddr`` (cached)."""
+-        key = ("apfs-node", self.token, paddr)
++        if size < 0 or (size and size % self.block_size):
++            raise CorruptDataError(f"apfs: {what}: invalid mapped object size {size}")
++        n = size // self.block_size if size else 1
++        if paddr < 0 or paddr + n > self.nblocks:
++            raise CorruptDataError(f"apfs: {what}: object outside container")
++        # Keep callable objects (not their reusable id()) and crypto interpretation
++        # alive with the entry. A volume supplies its current VEK as crypto context.
++        key = ("apfs-node", self.token, paddr, size, oid, keyfn, fixed, decrypt, decrypt_context, context)
+         node = self.ctx.cache.get(key)
+         if node is not None:
+             return node  # type: ignore[return-value]
+-        n = max(1, size // self.block_size) if size else 1
+         data = self.read_blocks(paddr, n)
+         if decrypt is not None:
+             data = decrypt(data, paddr)
+-        check_object(data, what)
+-        node = BNode(data, keyfn, fixed, what, oid or paddr)
++        if len(data) != n * self.block_size:
++            raise CorruptDataError(f"apfs: {what}: truncated/decrypted object size")
++        if not context.noheader:
++            check_object(data, what)
++        node = BNode(data, keyfn, fixed, what, oid or paddr, context=context)
+         self.ctx.cache.put(key, node)
+         return node
+ 
+--- a/apfs-tools/src/fs_explorer/filesystems/apfs/fs.py
++++ b/apfs-tools/src/fs_explorer/filesystems/apfs/fs.py
+@@ -40,9 +40,10 @@
+ from ...io.blockmap import ChunkedRA, Extent, ExtentRA
+ from ...io.source import BytesRA, RandomAccess
+ from ...tree import DataSource, Node, Tree
+-from .btree import OBJ_PHYSICAL, BNode, BTree
++from .btree import (OBJ_PHYSICAL, OBJ_NOHEADER, OBJ_ENCRYPTED, OBJECT_TYPE_MASK, BNode, BTree, NodeFormat,
++                    check_object, hash_size)
+ from .container import APFS_INCOMPAT_SEALED_VOLUME, VolumeFacts
+-from .omap import OMAP_VAL_ENCRYPTED, OMap
++from .omap import OMAP_VAL_ENCRYPTED, OMAP_VAL_NOHEADER, OMap
+ 
+ if TYPE_CHECKING:
+     from .container import Container
+@@ -111,6 +112,12 @@
+ def fs_keyfn(hashed: bool) -> Callable[[memoryview], tuple[Any, ...]]:
+     """Sortable key tuples for fs-tree keys (the ``CompareStdDirKey`` order)."""
+ 
++    def name_end(data: bytes | memoryview, start: int, n: int, limit: int) -> int:
++        end = start + n
++        if n < 1 or end > limit or data[end - 1] != 0:
++            raise CorruptDataError("apfs: malformed name length/terminator in fs-tree key")
++        return end
++
+     def key(mv: memoryview) -> tuple[Any, ...]:
+         if len(mv) < 8:
+             raise CorruptDataError("apfs: short fs-tree key")
+@@ -123,12 +130,14 @@
+                     raise CorruptDataError("apfs: short directory record key")
+                 nlh = _U32.unpack_from(mv, 8)[0]
+                 n = nlh & J_DREC_LEN_MASK
+-                return (oid, t, nlh >> 10, bytes(mv[12:12 + n]).rstrip(b"\0"))
++                end = name_end(mv, 12, n, len(mv))
++                return (oid, t, nlh >> 10, bytes(mv[12:end - 1]))
+             if len(mv) < 10:
+                 raise CorruptDataError("apfs: short directory record key")
+             n = _U16.unpack_from(mv, 8)[0]
+-            return (oid, t, 0, bytes(mv[10:10 + n]).rstrip(b"\0"))
+-        if t == J_FILE_EXTENT or t == J_SIBLING_LINK:
++            end = name_end(mv, 10, n, len(mv))
++            return (oid, t, 0, bytes(mv[10:end - 1]))
++        if t in (J_FILE_EXTENT, J_SIBLING_LINK, J_FILE_INFO):
+             if len(mv) < 16:
+                 raise CorruptDataError("apfs: short fs-tree key")
+             return (oid, t, _U64.unpack_from(mv, 8)[0])
+@@ -136,7 +145,8 @@
+             if len(mv) < 10:
+                 raise CorruptDataError("apfs: short fs-tree key")
+             n = _U16.unpack_from(mv, 8)[0]
+-            return (oid, t, bytes(mv[10:10 + n]).rstrip(b"\0"))
++            end = name_end(mv, 10, n, len(mv))
++            return (oid, t, bytes(mv[10:end - 1]))
+         return (oid, t)
+ 
+     def many(data: bytes, kstart: int, vend: int, locs: list[tuple[int, int, int, int]],
+@@ -160,22 +170,22 @@
+                     if kl < 12:
+                         raise CorruptDataError("apfs: short directory record key")
+                     nlh = u32(data, ka + 8)[0]
+-                    end = ka + min(12 + (nlh & J_DREC_LEN_MASK), kl)
+-                    append((oid, t, nlh >> 10, data[ka + 12:end].rstrip(b"\0")))
++                    end = name_end(data, ka + 12, nlh & J_DREC_LEN_MASK, ka + kl)
++                    append((oid, t, nlh >> 10, data[ka + 12:end - 1]))
+                 else:
+                     if kl < 10:
+                         raise CorruptDataError("apfs: short directory record key")
+-                    end = ka + min(10 + u16(data, ka + 8)[0], kl)
+-                    append((oid, t, 0, data[ka + 10:end].rstrip(b"\0")))
+-            elif t == J_FILE_EXTENT or t == J_SIBLING_LINK:
++                    end = name_end(data, ka + 10, u16(data, ka + 8)[0], ka + kl)
++                    append((oid, t, 0, data[ka + 10:end - 1]))
++            elif t in (J_FILE_EXTENT, J_SIBLING_LINK, J_FILE_INFO):
+                 if kl < 16:
+                     raise CorruptDataError("apfs: short fs-tree key")
+                 append((oid, t, u64(data, ka + 8)[0]))
+             elif t == J_XATTR or t == J_SNAP_NAME:
+                 if kl < 10:
+                     raise CorruptDataError("apfs: short fs-tree key")
+-                end = ka + min(10 + u16(data, ka + 8)[0], kl)
+-                append((oid, t, data[ka + 10:end].rstrip(b"\0")))
++                end = name_end(data, ka + 10, u16(data, ka + 8)[0], ka + kl)
++                append((oid, t, data[ka + 10:end - 1]))
+             else:
+                 append((oid, t))
+         return out
+@@ -285,7 +295,11 @@
+         self.sealed = bool(f.incompat & APFS_INCOMPAT_SEALED_VOLUME)
+         self._vsb = vsb
+         self._keyfn = fs_keyfn(self.hashed)
+-        self._physical = bool(_U32.unpack_from(vsb, 0x74)[0] & OBJ_PHYSICAL)
++        self._root_tree_type = _U32.unpack_from(vsb, 0x74)[0]
++        self._physical = bool(self._root_tree_type & OBJ_PHYSICAL)
++        self._seal_hash_type: int | None = None
++        self._seal_root_hash: bytes | None = None
++        self._node_size = 0
+         self._tree: BTree | None = None
+         self.fext: BTree | None = None
+         if f.encrypted:
+@@ -307,16 +321,65 @@
+ 
+                 self.ctx.note_backend("aes-xts", implementation("aes-xts", self.ctx.backend))
+             self.omap = OMap(f.omap_oid, c.read_block, c.load_node, f'volume "{f.name}" object map')
++            allowed_type = OBJECT_TYPE_MASK | OBJ_PHYSICAL | OBJ_NOHEADER | OBJ_ENCRYPTED
++            if self._root_tree_type & OBJECT_TYPE_MASK != 2 or self._root_tree_type & ~allowed_type:
++                raise CorruptDataError("apfs: unsupported fs-tree object type/storage")
++            if self._root_tree_type & OBJ_NOHEADER and not self.sealed:
++                raise CorruptDataError("apfs: headerless fs tree without a sealed volume")
+             if self.sealed:
++                if self._physical:
++                    raise UnsupportedFormatError("apfs", "sealed physical-pointer trees are not supported")
++                if f.role_code != 1:
++                    raise CorruptDataError("apfs: sealed volume is not a System volume")
++                self._seal_hash_type, self._seal_root_hash = self._integrity_meta()
+                 fext_oid = _U64.unpack_from(self._vsb, 0x408)[0]
+                 if not fext_oid:
+                     raise UnsupportedFormatError("apfs", "sealed volume without a file-extent tree")
+                 load: Callable[..., BNode] = lambda oid, level=-1: c.load_node(oid, _fext_key, (16, 16), "fext tree")  # noqa: E731
+                 self.fext = BTree(load(fext_oid), load, "fext tree")
+-            self._tree = BTree(self._fs_node(f.root_tree_oid, -1), self._fs_node, "fs tree")
++            root = self._fs_node(f.root_tree_oid, -1)
++            tree = BTree(root, self._fs_node, "fs tree", hash_type=self._seal_hash_type,
++                         root_hash=self._seal_root_hash)
++            self._node_size = tree.info[1]
++            self._tree = tree
+         return self._tree
+ 
+     # ------------------------------------------------------------------ nodes
++
++    def _integrity_meta(self) -> tuple[int, bytes]:
++        """Resolve the virtual integrity OID through this volume's OMAP, then
++        validate its ordinary Fletcher object before reading any root digest.
++
++        Apple's packed v1 ends at byte 56; v2 adds nine reserved uint64s.
++        This validates metadata consistency, not an externally trusted seal or
++        file data hashes/signatures.
++        """
++        oid = _U64.unpack_from(self._vsb, 0x400)[0]
++        if not oid:
++            raise CorruptDataError("apfs: sealed volume without integrity metadata")
++        m = self.omap.resolve(oid, self.xid, "integrity metadata")
++        if m.flags & ~0x1f or m.flags & OMAP_VAL_NOHEADER or m.size <= 0 or m.size % self.c.block_size:
++            raise CorruptDataError("apfs: invalid integrity metadata mapping")
++        data = self.c.read_blocks(m.paddr, m.size // self.c.block_size)
++        if m.flags & OMAP_VAL_ENCRYPTED:
++            if self.vek is None:
++                raise CorruptDataError("apfs: encrypted integrity metadata without key")
++            data = self._decrypt_node(data, m.paddr)
++        actual_oid, xid, kind, _ = check_object(data, "integrity metadata")
++        if kind & ~OBJ_ENCRYPTED != 0x1e or actual_oid != oid or xid > self.xid:
++            raise CorruptDataError("apfs: invalid integrity metadata object type/identity")
++        if len(data) < 56:
++            raise CorruptDataError("apfs: truncated integrity metadata")
++        version, flags, algorithm, offset, broken_xid = struct.unpack_from("<IIIIQ", data, 32)
++        if version not in (1, 2):
++            raise UnsupportedFormatError("apfs", f"unsupported integrity metadata version {version}")
++        if flags or broken_xid:
++            raise CorruptDataError("apfs: broken or unsupported seal flags/transaction")
++        minimum = 128 if version == 2 else 56
++        size = hash_size(algorithm)
++        if offset < minimum or offset + size > len(data):
++            raise CorruptDataError("apfs: integrity root hash outside metadata object")
++        return algorithm, data[offset:offset + size]
+ 
+     def _decrypt_node(self, data: bytes, paddr: int) -> bytes:
+         return self._xts(data, paddr * (self.c.block_size // 512))
+@@ -331,11 +394,28 @@
+         return out
+ 
+     def _fs_node(self, oid: int, level: int) -> BNode:
++        if self.sealed and level >= 0:
++            # Sealed index entries encode virtual OIDs relative to the root OID.
++            # Resolve the resulting absolute OID through the volume OMAP; this
++            # is not a physical-address guess or an alternate lookup fallback.
++            base = self.facts.root_tree_oid
++            if type(oid) is not int or not 0 < oid <= 0xffffffffffffffff - base:
++                raise CorruptDataError("apfs: sealed child object identifier overflows its root-relative range")
++            oid += base
++        def context(mapping_flags: int = 0) -> NodeFormat:
++            return NodeFormat(noheader=self.sealed, hashed=self.sealed, root=level == -1,
++                              level=level, tree_type=self._root_tree_type, node_size=self._node_size,
++                              mapping_flags=mapping_flags, hash_type=self._seal_hash_type)
+         if self._physical:
+-            return self.c.load_node(oid, self._keyfn, None, "fs tree", oid=oid)
++            return self.c.load_node(oid, self._keyfn, None, "fs tree", oid=oid, context=context())
+         m = self.omap.resolve(oid, self.xid, "fs tree")
++        if m.flags & ~0x1f or m.size <= 0 or bool(m.flags & OMAP_VAL_NOHEADER) != self.sealed:
++            raise CorruptDataError("apfs: fs-tree mapping contradicts sealed/headerless context")
++        if m.flags & OMAP_VAL_ENCRYPTED and self.vek is None:
++            raise CorruptDataError("apfs: encrypted fs-tree node without key")
+         dec = self._decrypt_node if (m.flags & OMAP_VAL_ENCRYPTED and self.vek is not None) else None
+-        return self.c.load_node(m.paddr, self._keyfn, None, "fs tree", decrypt=dec, size=m.size, oid=oid)
++        return self.c.load_node(m.paddr, self._keyfn, None, "fs tree", decrypt=dec, size=m.size, oid=oid,
++                                context=context(m.flags), decrypt_context=self.vek)
+ 
+     # ---------------------------------------------------------------- records
+ 
+@@ -578,6 +658,8 @@
+         if not self.hashed:
+             v = self.tree.get((ref.ino, J_DREC, 0, name.encode("utf-8", "surrogateescape")))
+             if v is not None:
++                if len(v) < _DREC_VAL.size:
++                    raise CorruptDataError("apfs: short directory record")
+                 fid = _DREC_VAL.unpack_from(v, 0)[0]
+                 return self._stat_node(name, fid, _DREC_VAL.unpack_from(v, 0)[2])
+             return super().lookup(node, name)

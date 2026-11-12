@@ -1,0 +1,25 @@
+--- /out/vmapple.before.c	2026-10-27 18:44:27.848175600 +0000
++++ /work/orchard-golden-ctrr/qemu/hw/vmapple/vmapple.c	2026-10-27 18:44:27.849140581 +0000
+@@ -37,6 +37,7 @@
+ #include "hw/intc/arm_gic.h"
+ #include "hw/intc/arm_gicv3_common.h"
+ #include "hw/misc/pvpanic.h"
++#include "hw/misc/unimp.h"
+ #include "hw/pci-host/gpex.h"
+ #include "hw/usb/hcd-xhci-pci.h"
+ #include "hw/virtio/virtio-pci.h"
+@@ -735,6 +736,14 @@
+ 
+     create_cfg(vms, sysmem, &error_fatal);
+ 
++    /* Experimental CTRR absence probe only: logged zero reads and discarded
++     * writes, with no protection, locking or enforcement implemented.
++     * Same generic placeholder as tqmane/qemu-vphone GPL-2.0-or-later commit
++     * 3ed85774c2989addec3056a866991762b60c4b5c, vresearch101 AVP_CTRR.
++     * No CTRR identification magic, version or bank state is advertised.
++     */
++    create_unimplemented_device("avp-ctrr unavailable", 0x30260000, 0x10000);
++
+     /* Diagnostic AVP RTC storage only; the real PL031 remains unchanged. */
+     memory_region_init_io(&vms->avp_rtc_iomem, NULL, &vmapple_avp_rtc_ops,
+                           vms, "avp-rtc diagnostic storage", 0x1000);

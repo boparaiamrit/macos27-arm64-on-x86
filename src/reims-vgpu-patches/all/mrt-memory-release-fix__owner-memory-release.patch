@@ -1,0 +1,121 @@
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
+@@ -112,6 +112,28 @@
+         // block indices mean different things.
+         BufferBacking::Slab(token) => slabs.release(device, token),
+     }
++}
++
++/// Release engine-owned image backing after every view and the image are dead.
++/// The slab ledger is authoritative for shared ranges; an untracked allocation
++/// is dedicated. Guest-import parents have a different owner and never enter.
++unsafe fn release_image_backing(
++    device: &ash::Device,
++    pool: &mut slab::SlabPool,
++    image: vk::Image,
++    memory: vk::DeviceMemory,
++) {
++    let shared = pool.free_image(device, image);
++    if !shared {
++        device.free_memory(memory, None);
++    }
++    #[cfg(test)]
++    eprintln!(
++        "PARENT_IMAGE_BACKING_RELEASE image={:#x} memory={:#x} owner={}",
++        image.as_raw(),
++        memory.as_raw(),
++        if shared { "slab" } else { "dedicated" }
++    );
+ }
+ 
+ pub(crate) struct TargetSlot {
+@@ -1355,9 +1377,7 @@
+                 // sub-allocation, and freeing memory under a live image is UB.
+                 device.destroy_image_view(view, None);
+                 device.destroy_image(image, None);
+-                if !self.slab.free_image(device, image) {
+-                    device.free_memory(memory, None);
+-                }
++                release_image_backing(device, &mut self.slab, image, memory);
+             }
+             DeferredHandle::GuestImage {
+                 image,
+@@ -1381,16 +1401,12 @@
+             DeferredHandle::RecycleSampled(slot) => {
+                 device.destroy_image_view(slot.view, None);
+                 device.destroy_image(slot.image, None);
+-                if !self.slab.free_image(device, slot.image) {
+-                    device.free_memory(slot.memory, None);
+-                }
++                release_image_backing(device, &mut self.slab, slot.image, slot.memory);
+             }
+             DeferredHandle::RecycleTarget(img) => {
+                 device.destroy_image_view(img.view, None);
+                 device.destroy_image(img.image, None);
+-                if !self.slab.free_image(device, img.image) {
+-                    device.free_memory(img.memory, None);
+-                }
++                release_image_backing(device, &mut self.slab, img.image, img.memory);
+             }
+             DeferredHandle::ImageView(view) => device.destroy_image_view(view, None),
+             DeferredHandle::Framebuffer(fb) => device.destroy_framebuffer(fb, None),
+@@ -2129,7 +2145,8 @@
+ 
+ /// Ownership route for a resident image's memory.
+ ///
+-/// A recyclable allocation belongs to the image slab and may re-enter the
++/// A recyclable allocation is engine-owned, either shared-slab or dedicated,
++/// and may re-enter the
+ /// geometry-keyed target pool. A guest import aliases one particular surface
+ /// allocation, so recycling it under another identity would bind that surface's
+ /// pages to unrelated guest work. The enum forces every retirement path to
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/teardown.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/teardown.rs
+@@ -126,10 +126,10 @@
+         for (_, fb) in self.ad_hoc_framebuffers.drain() {
+             device.destroy_framebuffer(fb, None);
+         }
+-        // Sampled / target / registry images are slab-backed: destroy the image
+-        // + view handles here, but their memory belongs to shared blocks freed
+-        // once by `self.slab.destroy_all(device)` at the end — never a per-image
+-        // `vkFreeMemory` (that would double-free a block many images share).
++        // Sampled and snapshot images are slab-backed. Target/recycle/registry
++        // images may instead carry dedicated attachment memory, so those drains
++        // use the same release owner as hot retirement. Imported registry parents
++        // remain with host_ram_imports; shared slab blocks are never raw-freed.
+         for s in self.sampled_free.drain() {
+             device.destroy_image_view(s.view, None);
+             device.destroy_image(s.image, None);
+@@ -147,6 +147,7 @@
+             );
+             device.destroy_image_view(img.view, None);
+             device.destroy_image(img.image, None);
++            release_image_backing(device, &mut self.slab, img.image, img.memory);
+         }
+         for s in self.sampled_live.drain(..) {
+             device.destroy_image_view(s.view, None);
+@@ -185,12 +186,14 @@
+             device.destroy_framebuffer(t.framebuffer, None);
+             device.destroy_image_view(t.view, None);
+             device.destroy_image(t.image, None);
++            release_image_backing(device, &mut self.slab, t.image, t.memory);
+         }
+         self.target_order.clear();
+         if let Some(t) = self.multisample_target.take() {
+             device.destroy_framebuffer(t.framebuffer, None);
+             device.destroy_image_view(t.view, None);
+             device.destroy_image(t.image, None);
++            release_image_backing(device, &mut self.slab, t.image, t.memory);
+         }
+         // The wholesale half of the window's licence, in the same statement as
+         // the destruction it answers for.
+@@ -218,6 +221,9 @@
+             }
+             device.destroy_image_view(t.view, None);
+             device.destroy_image(t.image, None);
++            if let ResidentMemory::Recyclable(memory) = t.memory {
++                release_image_backing(device, &mut self.slab, t.image, memory);
++            }
+         }
+         self.registry_order.clear();
+         // Every fence above was waited, so nothing can still be reading or

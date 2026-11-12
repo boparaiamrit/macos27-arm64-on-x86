@@ -1,0 +1,22 @@
+# Never commit proprietary guest binaries, disk images, NVRAM, or hardware IDs
+*.bin
+*.img
+*.qcow2
+*.raw
+*.asif
+*.lzfse
+*.ipsw
+*.dmg
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.pdb
+*.exe
+*.a
+*.so
+*.dylib
+*.macho
+inputs/config.json
+__pycache__/
+*.pyc
+.DS_Store

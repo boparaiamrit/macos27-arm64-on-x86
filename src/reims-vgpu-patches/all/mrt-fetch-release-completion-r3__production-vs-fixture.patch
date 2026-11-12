@@ -1,0 +1,225 @@
+--- R2/exec.rs
++++ R3/exec.rs
+@@ -8851,7 +8851,7 @@
+             width: 1,
+             height: 1,
+             generation: 1,
+-            format: crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM.into(),
++            format: vk::Format::D32_SFLOAT,
+         };
+         let mut resident = Some(AcquiredDepth {
+             view: vk::ImageView::from_raw(17),
+--- parent/engine/mod.rs
++++ qualification/engine/mod.rs
+@@ -6669,3 +6669,8 @@
+         assert_eq!(packed.len(), 4);
+     }
+ }
++
++// R3 qualification only; excluded from production builds.
++#[cfg(test)]
++#[path = "r3-qualification.rs"]
++mod r3_qualification;
+--- /dev/null
++++ crates/reims-vgpu/src/backend/vulkan/engine/r3-qualification.rs
+@@ -0,0 +1,115 @@
++// Qualification only: included under cfg(test) from engine/mod.rs.
++use super as engine;
++use super::*;
++use ash::vk;
++use std::path::PathBuf;
++use std::sync::Arc;
++
++fn engine_req(vert: &[u32], frag: &[u32], w: u32, h: u32) -> DrawRequest {
++    DrawRequest { vert_spirv:Arc::new(vert.to_vec()), frag_spirv:Arc::new(frag.to_vec()), width:w,height:h,vertex_count:3,first_vertex:0,instance_count:Some(1),base_instance:0,primitive_topology:PrimitiveTopology(reims_vgpu_core::topology::PrimitiveType::Triangle),..Default::default() }
++}
++fn color_attachment(format:u16,clear:[f64;4])->ColorAttachmentState {
++    crate::backend::vulkan::translate::pixel::color_attachment(format).unwrap().0.with_clear(clear)
++}
++fn semantic_rgba(out:&DrawOutput)->Vec<u8>{let mut p=out.pixels.clone();if out.pixels_bgra{for c in p.chunks_exact_mut(4){c.swap(0,2)}}p}
++include!("r3-pixel-helpers.rs");
++
++fn depth(identity:Option<TargetIdentity>,stencil:bool)->DepthState {
++    DepthState { identity,test_enable:true,write_enable:true,compare:SamplerCompareFunction::Always,clear_value:1.0,load:false,stencil:if stencil {let face=StencilFaceOps{compare:SamplerCompareFunction::Always,fail_op:StencilOp::Keep,depth_fail_op:StencilOp::Keep,pass_op:StencilOp::Keep,read_mask:255,write_mask:255};Some(StencilState{front:face,back:face,reference_front:0,reference_back:0,clear_value:0})}else{None} }
++}
++fn sampled(id:TargetIdentity)->SampledImageResource {
++    SampledImageResource{binding:1,array_element:0,descriptor_count:1,width:20,height:20,layers:1,kind:reims_vgpu_core::texture_shape::TextureKind::D2,multisampled:false,source:SampledSource::Target(id),byte_origin:Default::default(),format:vk::Format::R8G8B8A8_UNORM,identity:None,swizzle:Default::default()}
++}
++fn primary()->DrawRequest {
++    let mut req=engine_req(&mrt_order_words("fetch.vert.spv"),&mrt_order_words("r3-primary.frag.spv"),20,20);
++    req.target_identity=Some(mrt_order_identity(0xf000));
++    req.color_attachment=Some(color_attachment(crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM,[0.2,0.4,0.6,1.0]));
++    req.target_rgba8=Some(Arc::new([51,102,153,255].repeat(400)));
++    req.color_input=ColorInputs::parse([0]).unwrap();
++    req.scissors.push(ScissorResource{x:2,y:2,width:16,height:16});
++    req
++}
++fn actual_layer_maps(){
++    let maps=std::fs::read_to_string("/proc/self/maps").unwrap();
++    assert!(maps.contains("libVkLayer_khronos_validation.so"),"actual layer mapping mandatory");
++    for l in maps.lines().filter(|l|l.contains("/bundle/")||l.contains("/soft/")){eprintln!("R3_ACTUAL_MAP {l}");}
++    eprintln!("R3_ACTIVE_SETTINGS {}",std::fs::read_to_string("/validation/vk_layer_settings.txt").unwrap());
++}
++fn destroy_actual_engine(state:&crate::model::DeviceState){
++    super::device_caches(state).unwrap().with(|caches| {
++        let mut g=super::lock_engine();
++        let mut ctx=g.owner.ctx.take().expect("actual Vulkan device was created");
++        ctx.queue_wait_idle().expect("quiesce before owned destruction");
++        unsafe {caches.destroy_all(&ctx.device);g.pools.destroy_all(&ctx.device);eprintln!("R3_ACTUAL_DEVICE_DESTROY_BEGIN");ctx.destroy();eprintln!("R3_ACTUAL_DEVICE_DESTROY_COMPLETE");}
++        *caches=super::ObjectCaches::new();g.pools=super::ResourcePools::new();g.owner=super::ContextOwner::new();
++    });
++}
++#[test]
++fn r3_actual_engine_case(){
++    crate::observe::redirect_logs_for_tests();
++    let state=crate::model::DeviceState::new(crate::model::DeviceId(1),reims_vgpu_protocol::gva::PAGE_SHIFT_X86);
++    let case=std::env::var("R3_CASE").unwrap();
++    let probe=std::env::var("REIMS_VGPU_PASS_CHURN").map(|v|v=="on").unwrap_or(false);
++    let mut req=primary();
++    eprintln!("R3_CASE_BEGIN case={case} probe={probe} narrow={:?}",std::env::var("REIMS_VGPU_COLOR_GENERAL"));
++    if case=="primary" {
++        let out=execute_draw_request(&state,&req).expect("CPU-seeded selected0 Preserve");
++        mrt_order_pixels(&format!("r3-primary-seeded-probe-{probe}"),&semantic_rgba(&out),[0.15,0.25,0.35,1.0],[0.2,0.4,0.6,1.0]);
++        assert!(resident_content_ready(req.target_identity.as_ref().unwrap()));
++        req.target_rgba8=None;req.load_from_target=true;
++        let out=execute_draw_request(&state,&req).expect("selected0 resident LOAD after readback");
++        let expected=[0.15f32,0.25,0.35,1.0].map(|v|((v*255.0).round()/255.0)*0.5+0.05);
++        mrt_order_pixels(&format!("r3-primary-resident-probe-{probe}"),&semantic_rgba(&out),[expected[0],expected[1],expected[2],1.0],[0.2,0.4,0.6,1.0]);
++        assert!(resident_content_ready(req.target_identity.as_ref().unwrap()));
++    } else if case=="mixed-depth-off" {
++        assert!(!probe);
++        req.frag_spirv=Arc::new(mrt_order_words("fetch-one.frag.spv"));req.color_input=ColorInputs::parse([1]).unwrap();
++        req.secondary_targets.push(SecondaryColorTarget{identity:mrt_order_identity(0xf001),width:20,height:20,attachment:color_attachment(crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM,[0.8,0.3,0.1,1.0]),load:false,blend:None,color_write_mask:Default::default()});
++        req.depth=Some(depth(None,false));
++        let out=execute_draw_request(&state,&req).expect("probe-off mixed MRT and transient depth");
++        mrt_order_pixels("r3-mixed-depth-off",&semantic_rgba(&out),[0.45,0.20,0.10,1.0],[0.2,0.4,0.6,1.0]);
++    } else if case=="held-open-off" {
++        assert!(!probe);req.skip_readback=true;req.render_pass_continues=true;
++        execute_draw_request(&state,&req).expect("held-open first seeded Preserve");req.target_rgba8=None;req.load_from_target=true;
++        execute_draw_request(&state,&req).expect("held-open resident Preserve continuation");
++        let out=read_target(req.target_identity.as_ref().unwrap()).expect("close then read held-open render pass").into_rgba8().unwrap();
++        let expected=[0.15f32,0.25,0.35].map(|v|((v*255.0).round()/255.0)*0.5+0.05);
++        mrt_order_pixels("r3-held-open",&out,[expected[0],expected[1],expected[2],1.0],[0.2,0.4,0.6,1.0]);
++        eprintln!("R3_HELD_OPEN_COUNTERS {:?}",counter_snapshot());
++    } else {
++        assert!(probe,"refusal case requires actual probe request");
++        if case=="secondary-load-refusal" {
++            let mut warm=primary();warm.target_identity=Some(mrt_order_identity(0xf001));
++            execute_draw_request(&state,&warm).expect("real ready secondary seeded as primary");
++            assert!(resident_content_ready(warm.target_identity.as_ref().unwrap()));
++        }
++        if case=="feedback-refusal" {
++            execute_draw_request(&state,&req).expect("real primary seed before feedback alias");
++            req.target_rgba8=None;req.load_from_target=true;
++            assert!(attachment_feedback_loop_active(),"host feedback support required for this admitted case");
++        }
++        match case.as_str(){
++            "depth-refusal-eight"=>{req.depth=Some(depth(None,false));},
++            "depth-stencil-refusal"=>{req.depth=Some(depth(None,true));},
++            "secondary-clear-refusal"|"secondary-load-refusal"=>{
++                req.color_input=ColorInputs::parse([0,1]).unwrap();req.frag_spirv=Arc::new(mrt_order_words("fetch-both.frag.spv"));
++                req.secondary_targets.push(SecondaryColorTarget{identity:mrt_order_identity(0xf001),width:20,height:20,attachment:color_attachment(crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM,[0.8,0.3,0.1,1.0]),load:case=="secondary-load-refusal",blend:None,color_write_mask:Default::default()});
++            },
++            "msaa-refusal"=>{req.color_input=ColorInputs::default();req.frag_spirv=Arc::new(mrt_order_words("r3-solid.frag.spv"));req.raster_sample_count=4;req.color_sample_count=4;req.multisample_resolve=true;},
++            "clear-refusal"=>{req.target_rgba8=None;req.color0_declared=Some(reims_vgpu_protocol::pass_action::LoadAction::Clear);},
++            "dontcare-refusal"=>{req.target_rgba8=None;req.color0_declared=Some(reims_vgpu_protocol::pass_action::LoadAction::DontCare);},
++            "feedback-refusal"=>{req.sampled_images.push(sampled(req.target_identity.clone().unwrap()));},
++            "resident-depth-refusal"=>{req.depth=Some(depth(Some(TargetIdentity::Texture{ref_:0xf002,width:20,height:20,generation:1,stencil:false}),false));},
++            _=>panic!("unknown required case {case}")
++        }
++        let iterations=if case=="depth-refusal-eight"{8}else{1};
++        for i in 0..iterations {
++            let error=execute_draw_request(&state,&req).expect_err("complete unsupported shape must refuse before draw/probe");
++            let text=error.to_string();
++            assert!(matches!(&error,DrawError::Unsupported(super::reason::DrawReason::ProbeScope(super::caches::ProbeScopeDecline::PassChurn{..}))),"exact typed probe scope required: {text}");
++            eprintln!("R3_TYPED_REFUSAL case={case} iteration={i} {text}");
++        }
++    }
++    actual_layer_maps();destroy_actual_engine(&state);
++    eprintln!("R3_CASE_COMPLETE case={case} probe={probe}");
++}
+--- /dev/null
++++ crates/reims-vgpu/src/backend/vulkan/engine/r3-pixel-helpers.rs
+@@ -0,0 +1,66 @@
++// Authored actual-engine oracles. A Vulkan init/draw/readback failure is a failure.
++fn mrt_order_words(name: &str) -> Vec<u32> {
++    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
++        .join("tests/fixtures/mrt-order")
++        .join(name);
++    let bytes = std::fs::read(path).expect("authored qualified SPIR-V exists");
++    assert_eq!(bytes.len() % 4, 0);
++    bytes
++        .chunks_exact(4)
++        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
++        .collect()
++}
++fn mrt_order_identity(id: u64) -> TargetIdentity {
++    TargetIdentity::Gva {
++        gva: id * 0x10000,
++        width: 20,
++        height: 20,
++        generation: 1,
++        format: ash::vk::Format::R8G8B8A8_UNORM,
++    }
++}
++fn mrt_order_pixels(label: &str, px: &[u8], inside: [f32; 4], outside: [f32; 4]) {
++    assert_eq!(px.len(), 20 * 20 * 4, "{label}: exact readback length");
++    assert!(inside.iter().chain(outside.iter()).all(|v| v.is_finite()));
++    let mut max_error = 0.0f32;
++    for y in 0..20 {
++        for x in 0..20 {
++            let expected = if (2..18).contains(&x) && (2..18).contains(&y) {
++                inside
++            } else {
++                outside
++            };
++            for c in 0..4 {
++                let actual = px[(y * 20 + x) * 4 + c] as f32 / 255.0;
++                max_error = max_error.max((actual - expected[c]).abs());
++                assert!(
++                    (actual - expected[c]).abs() <= 3.0 / 255.0,
++                    "{label} x={x} y={y} channel={c} got={actual} expected={}",
++                    expected[c]
++                );
++            }
++        }
++    }
++
++    let directory = PathBuf::from("/out/engine-readbacks");
++    std::fs::create_dir_all(&directory).expect("owned readback output directory");
++    let stamp = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap()
++        .as_nanos();
++    let file = directory.join(format!("{label}-{stamp}.rgba8"));
++    use std::io::Write as _;
++    std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(&file)
++        .expect("preserve any prior readback")
++        .write_all(px)
++        .unwrap();
++    let metadata = format!(
++        r#"{{"label":"{label}","width":20,"height":20,"channels":4,"expected_inside":{inside:?},"expected_guard":{outside:?},"tolerance":{},"maximum_error":{max_error},"guard_pixels":144}}"#,
++        3.0 / 255.0
++    );
++    std::fs::write(file.with_extension("json"), metadata).unwrap();
++    eprintln!("MRT_ORDER_PIXELS label={label} pixels=400 channels=1600 inner_pixels=256 guard_pixels=144 max_error={max_error} expected={inside:?} guard={outside:?}");
++}
+--- /dev/null
++++ crates/reims-vgpu/tests/fixtures/mrt-order/r3-primary.frag
+@@ -0,0 +1,4 @@
++#version 450
++layout(input_attachment_index=0,set=0,binding=192) uniform subpassInput input0;
++layout(location=0) out vec4 primary;
++void main(){primary=vec4(subpassLoad(input0).rgb*.5+.05,1);}
+--- /dev/null
++++ crates/reims-vgpu/tests/fixtures/mrt-order/r3-solid.frag
+@@ -0,0 +1,2 @@
++#version 450
++layout(location=0) out vec4 primary;void main(){primary=vec4(.25,.5,.75,1);}
+
+Qualification SPIR-V crates/reims-vgpu/tests/fixtures/mrt-order/r3-solid.frag.spv: sha256=ec4268936f722cc8238131b0d4511d4737f5e24b963f3e23774a23f21e632974, bytes=452
+
+Qualification SPIR-V crates/reims-vgpu/tests/fixtures/mrt-order/r3-primary.frag.spv: sha256=7f0b3e63524d9c45c7c6c4ba1813aee62dbf765c4a01c31a18ac0adb01ec9434, bytes=856

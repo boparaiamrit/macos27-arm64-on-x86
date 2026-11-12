@@ -1,0 +1,698 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,5 +1,5 @@
+ [workspace]
+-members = ["validation"]
++members = []
+ resolver = "2"
+ 
+ [package]
+--- /dev/null
++++ b/examples/translate_stage_fixture.rs
+@@ -0,0 +1,24 @@
++//! Translate a local synthetic textual AIR fixture through the public production API.
++use metal2vulkan::passes::Stage;
++use std::{fs, path::PathBuf};
++
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let args: Vec<_> = std::env::args_os().skip(1).collect();
++    if args.len() != 3 {
++        return Err("expected stage input.ll output.spv".into());
++    }
++    let stage = match args[0].to_str() {
++        Some("vertex") => Stage::Vertex,
++        Some("fragment") => Stage::Fragment,
++        _ => return Err("expected vertex or fragment".into()),
++    };
++    let source = fs::read_to_string(&args[1])?;
++    let output = PathBuf::from(&args[2]);
++    let tmp = std::env::temp_dir().join(format!("m2v_stage_fixture_{}", std::process::id()));
++    fs::create_dir(&tmp)?;
++    let result = metal2vulkan::translate_sanitized_native(&source, stage, &tmp);
++    fs::remove_dir_all(&tmp)?;
++    let payload = result?;
++    fs::write(output, payload)?;
++    Ok(())
++}
+--- a/src/passes/resources/collapse.rs
++++ b/src/passes/resources/collapse.rs
+@@ -98,6 +98,27 @@
+                     vec![Operand::IdRef(lid)],
+                 ));
+                 splices.push((pid, cid));
++            }
++            ParamBinding::LoadVarFloatConverted {
++                var,
++                load_ty,
++                param_ty,
++            } => {
++                let loaded = ctx.module.fresh_id();
++                loads.push(Instruction::new(
++                    Op::Load,
++                    Some(load_ty),
++                    Some(loaded),
++                    vec![Operand::IdRef(var)],
++                ));
++                let converted = ctx.module.fresh_id();
++                loads.push(Instruction::new(
++                    Op::FConvert,
++                    Some(param_ty),
++                    Some(converted),
++                    vec![Operand::IdRef(loaded)],
++                ));
++                splices.push((pid, converted));
+             }
+             ParamBinding::LoadVarBitcast {
+                 var,
+--- a/src/passes/stage_input/air_layout.rs
++++ b/src/passes/stage_input/air_layout.rs
+@@ -77,35 +77,45 @@
+     loc: u32,
+     ty: Word,
+     defs: &HashMap<Word, Instruction>,
+-) -> Word {
++) -> Result<Word, String> {
++    let interface_ty = portable_stage_float_type(ctx, ty)?;
++    if interface_ty != ty {
++        return Ok(interface_ty);
++    }
+     let Some(name) = frag.and_then(|meta| meta.varying_type(loc)) else {
+-        return ty;
++        return Ok(ty);
+     };
+     let Some((bits, signed, lanes)) = air_integer_type_shape(name) else {
+-        return ty;
+-    };
+-    integer_interface_type_like(ctx, ty, bits, signed, lanes, defs).unwrap_or(ty)
+-}
+-
+-/// Vulkan vertex fetch expands 8- and 16-bit integer formats to 32-bit shader values. Model the
++        return Ok(ty);
++    };
++    Ok(integer_interface_type_like(ctx, ty, bits, signed, lanes, defs).unwrap_or(ty))
++}
++
++/// Vulkan vertex fetch expands narrow floating/integer formats to 32-bit shader values. Model the
+ /// interface with that fetched type, preserving the AIR-declared signedness and vector width; the
+-/// entry binding converts back to the LLVM parameter's narrow, signless integer representation.
++/// entry binding numerically converts back to the LLVM parameter's narrow representation.
+ pub(in crate::passes) fn vertex_attribute_interface_type(
+     ctx: &mut Ctx,
+     vert: Option<&VertMeta>,
+     loc: u32,
+     ty: Word,
+     defs: &HashMap<Word, Instruction>,
+-) -> Word {
++) -> Result<Word, String> {
++    let interface_ty = portable_stage_float_type(ctx, ty)?;
++    if interface_ty != ty {
++        return Ok(interface_ty);
++    }
+     let Some(name) = vert.and_then(|meta| meta.vertex_input_type(loc)) else {
+-        return ty;
++        return Ok(ty);
+     };
+     let Some((bits, signed, lanes)) = air_integer_type_shape(name) else {
+-        return ty;
++        return Ok(ty);
+     };
+     let interface_bits = bits.max(32);
+-    integer_interface_type_for_shape(ctx, ty, bits, interface_bits, signed, lanes, defs)
+-        .unwrap_or(ty)
++    Ok(
++        integer_interface_type_for_shape(ctx, ty, bits, interface_bits, signed, lanes, defs)
++            .unwrap_or(ty),
++    )
+ }
+ 
+ fn air_integer_type_shape(name: &str) -> Option<(u32, bool, u32)> {
+@@ -456,3 +466,76 @@
+             && inst.operands.first() == Some(&Operand::LiteralBit32(width))
+     })
+ }
++
++#[cfg(test)]
++mod portable_float_tests {
++    use super::*;
++    use crate::passes::resources::rewrites::combined_type_defs;
++
++    #[test]
++    fn half_scalar_and_vectors_use_float32_input_transport_without_metadata() {
++        for lanes in 1..=4 {
++            let mut ctx = Ctx::new(Module::new());
++            let original = if lanes == 1 {
++                ctx.ty_half()
++            } else {
++                ctx.ty_vech(lanes)
++            };
++            let expected = if lanes == 1 {
++                ctx.ty_float()
++            } else {
++                ctx.ty_vecf(lanes)
++            };
++            let defs = combined_type_defs(&ctx, &HashMap::new());
++            assert_eq!(
++                fragment_varying_interface_type(&mut ctx, None, 0, original, &defs)
++                    .expect("supported interface"),
++                expected
++            );
++            assert_eq!(
++                vertex_attribute_interface_type(&mut ctx, None, 0, original, &defs)
++                    .expect("supported interface"),
++                expected
++            );
++        }
++    }
++
++    #[test]
++    fn portable_float_inputs_keep_full_width_and_integer_types_without_metadata() {
++        let mut ctx = Ctx::new(Module::new());
++        let unchanged = [
++            ctx.ty_float(),
++            ctx.ty_vecf(4),
++            ctx.ty_uint(),
++            ctx.ty_vec_sint(2),
++        ];
++        let defs = combined_type_defs(&ctx, &HashMap::new());
++        for original in unchanged {
++            assert_eq!(
++                fragment_varying_interface_type(&mut ctx, None, 0, original, &defs)
++                    .expect("supported interface"),
++                original
++            );
++            assert_eq!(
++                vertex_attribute_interface_type(&mut ctx, None, 0, original, &defs)
++                    .expect("supported interface"),
++                original
++            );
++        }
++    }
++
++    #[test]
++    fn aggregate_half_stage_transport_is_refused_before_input_creation() {
++        let mut ctx = Ctx::new(Module::new());
++        let half = ctx.ty_half();
++        let array = ctx.ty_array(half, 2);
++        let defs = combined_type_defs(&ctx, &HashMap::new());
++        for result in [
++            fragment_varying_interface_type(&mut ctx, None, 0, array, &defs),
++            vertex_attribute_interface_type(&mut ctx, None, 0, array, &defs),
++        ] {
++            let error = result.expect_err("unsupported half aggregate");
++            assert!(error.contains("half aggregate stage interface"));
++        }
++    }
++}
+--- a/src/passes/stage_input/mod.rs
++++ b/src/passes/stage_input/mod.rs
+@@ -81,6 +81,14 @@
+     /// integer param (`ushort [[instance_id]]`, an i16): load the uint then `OpUConvert` it down to the
+     /// param's own width, so the body's 16-bit uses (`OpBitwiseAnd %ushort`) are width-consistent.
+     LoadVarConverted {
++        var: Word,
++        load_ty: Word,
++        param_ty: Word,
++    },
++    /// Float32 stage transport feeding an AIR half scalar/vector. Load the interface
++    /// type and numerically convert back before any body use; a bitcast would both
++    /// change the value and violate SPIR-V's equal-total-width rule.
++    LoadVarFloatConverted {
+         var: Word,
+         load_ty: Word,
+         param_ty: Word,
+@@ -1305,8 +1313,10 @@
+                 ));
+             } else {
+                 let interface_ty = match stage {
+-                    Stage::Fragment => fragment_varying_interface_type(ctx, frag, loc, *pty, &defs),
+-                    Stage::Vertex => vertex_attribute_interface_type(ctx, vert, loc, *pty, &defs),
++                    Stage::Fragment => {
++                        fragment_varying_interface_type(ctx, frag, loc, *pty, &defs)?
++                    }
++                    Stage::Vertex => vertex_attribute_interface_type(ctx, vert, loc, *pty, &defs)?,
+                     Stage::Kernel => *pty,
+                 };
+                 // Input var of the param value type at Location loc; load at entry.
+@@ -1334,6 +1344,15 @@
+                 ctx.interface.push(var);
+                 if interface_ty == *pty {
+                     bindings.push((*pid, ParamBinding::LoadVar { var, ty: *pty }));
++                } else if float_component_shape(ctx, *pty).is_some() {
++                    bindings.push((
++                        *pid,
++                        ParamBinding::LoadVarFloatConverted {
++                            var,
++                            load_ty: interface_ty,
++                            param_ty: *pty,
++                        },
++                    ));
+                 } else if matches!(stage, Stage::Vertex)
+                     && (type_int_shape(&defs, *pty).is_some()
+                         || defs.get(pty).is_some_and(|definition| {
+--- a/src/passes/stage_output/mod.rs
++++ b/src/passes/stage_output/mod.rs
+@@ -33,25 +33,25 @@
+     member_idx: usize,
+     ty: Word,
+     defs: &HashMap<Word, Instruction>,
+-) -> Word {
+-    let interface_ty = user_location_output_type(ctx, ty);
++) -> Result<Word, String> {
++    let interface_ty = user_location_output_type(ctx, ty)?;
+     if interface_ty != ty {
+-        return interface_ty;
++        return Ok(interface_ty);
+     }
+     let Some(name) = frag.and_then(|meta| meta.render_target_type_name(member_idx as u32)) else {
+-        return ty;
++        return Ok(ty);
+     };
+     if let Some((signed, lanes)) = air_integer_render_target_shape(name) {
+-        return int32_render_target_interface_type(ctx, signed, lanes, ty, defs).unwrap_or(ty);
+-    }
+-    ty
+-}
+-
+-fn user_location_output_type(ctx: &mut Ctx, ty: Word) -> Word {
++        return Ok(int32_render_target_interface_type(ctx, signed, lanes, ty, defs).unwrap_or(ty));
++    }
++    Ok(ty)
++}
++
++fn user_location_output_type(ctx: &mut Ctx, ty: Word) -> Result<Word, String> {
+     if type_def_of(ctx, ty).is_some_and(|definition| definition.class.opcode == Op::TypeBool) {
+-        ctx.ty_uint()
++        Ok(ctx.ty_uint())
+     } else {
+-        ty
++        portable_stage_float_type(ctx, ty)
+     }
+ }
+ 
+@@ -150,6 +150,21 @@
+ ) -> Word {
+     if src_ty == dst_ty {
+         return value;
++    }
++    if let (Some((src_bits, src_lanes)), Some((dst_bits, dst_lanes))) = (
++        float_component_shape(ctx, src_ty),
++        float_component_shape(ctx, dst_ty),
++    ) {
++        if src_bits != dst_bits && src_lanes == dst_lanes {
++            let converted = ctx.module.fresh_id();
++            stores.push(Instruction::new(
++                Op::FConvert,
++                Some(dst_ty),
++                Some(converted),
++                vec![Operand::IdRef(value)],
++            ));
++            return converted;
++        }
+     }
+     if let (Some((src_bits, _)), Some((dst_bits, dst_signed))) = (
+         int_component_shape_live(ctx, src_ty),
+@@ -757,7 +772,7 @@
+                         let output_ty = match kind {
+                             // `SampleMask` is `uint[1]` in SPIR-V; Metal returns the scalar mask.
+                             OutKind::SampleMask => ctx.ty_array(uint_ty, 1),
+-                            _ => fragment_output_type(ctx, frag, mi, *mty, defs),
++                            _ => fragment_output_type(ctx, frag, mi, *mty, defs)?,
+                         };
+                         let var = make_output_var(ctx, output_ty);
+                         match kind {
+@@ -825,7 +840,7 @@
+                             elem_ty: uint_ty,
+                         });
+                     } else if let Some(location) = fragment_output_location(frag, 0) {
+-                        let output_ty = fragment_output_type(ctx, frag, 0, ret_ty, defs);
++                        let output_ty = fragment_output_type(ctx, frag, 0, ret_ty, defs)?;
+                         let var = make_output_var(ctx, output_ty);
+                         decorate_location(&mut ctx.module, var, location);
+                         ctx.interface.push(var);
+@@ -888,7 +903,7 @@
+                             (OutKind::Builtin(builtin), _) => {
+                                 vertex_builtin_output_type(ctx, builtin, *mty)
+                             }
+-                            (OutKind::Location(_), _) => user_location_output_type(ctx, *mty),
++                            (OutKind::Location(_), _) => user_location_output_type(ctx, *mty)?,
+                         };
+                         let var = make_output_var(ctx, output_ty);
+                         match kind {
+@@ -1177,7 +1192,8 @@
+         let bool_ty = ctx.ty_bool();
+         let defs = combined_type_defs(&ctx, &HashMap::new());
+ 
+-        let output_ty = fragment_output_type(&mut ctx, None, 0, bool_ty, &defs);
++        let output_ty =
++            fragment_output_type(&mut ctx, None, 0, bool_ty, &defs).expect("bool interface");
+         assert_eq!(output_ty, ctx.ty_uint());
+ 
+         let bool_value = ctx.module.fresh_id();
+@@ -1188,4 +1204,82 @@
+         assert_eq!(stores[0].result_id, Some(converted));
+         assert_eq!(stores[0].result_type, Some(output_ty));
+     }
+-}
++
++    #[test]
++    fn half_scalar_and_vectors_use_float32_output_transport() {
++        for lanes in 1..=4 {
++            let mut ctx = Ctx::new(Module::new());
++            let original = if lanes == 1 {
++                ctx.ty_half()
++            } else {
++                ctx.ty_vech(lanes)
++            };
++            let expected = if lanes == 1 {
++                ctx.ty_float()
++            } else {
++                ctx.ty_vecf(lanes)
++            };
++            let defs = combined_type_defs(&ctx, &HashMap::new());
++            assert_eq!(
++                user_location_output_type(&mut ctx, original).expect("supported interface"),
++                expected
++            );
++            assert_eq!(
++                fragment_output_type(&mut ctx, None, 0, original, &defs)
++                    .expect("supported interface"),
++                expected
++            );
++            let value = ctx.module.fresh_id();
++            let mut stores = Vec::new();
++            let result = value_for_store(&mut ctx, &mut stores, value, original, expected);
++            assert_eq!(stores.len(), 1);
++            assert_eq!(stores[0].class.opcode, Op::FConvert);
++            assert_eq!(stores[0].result_type, Some(expected));
++            assert_eq!(stores[0].result_id, Some(result));
++            assert_eq!(stores[0].operands, vec![Operand::IdRef(value)]);
++        }
++    }
++
++    #[test]
++    fn portable_float_outputs_keep_full_width_and_integer_values_unchanged() {
++        let mut ctx = Ctx::new(Module::new());
++        let unchanged = [
++            ctx.ty_float(),
++            ctx.ty_vecf(4),
++            ctx.ty_uint(),
++            ctx.ty_vec_sint(2),
++        ];
++        for original in unchanged {
++            assert_eq!(
++                user_location_output_type(&mut ctx, original).expect("supported interface"),
++                original
++            );
++            let value = ctx.module.fresh_id();
++            let mut stores = Vec::new();
++            assert_eq!(
++                value_for_store(&mut ctx, &mut stores, value, original, original),
++                value
++            );
++            assert!(stores.is_empty());
++        }
++    }
++
++    #[test]
++    fn aggregate_half_stage_transport_is_refused_before_output_creation() {
++        let mut ctx = Ctx::new(Module::new());
++        let half = ctx.ty_half();
++        let array = ctx.ty_array(half, 2);
++        let nested = ctx.get_or_create(Op::TypeStruct, None, vec![Operand::IdRef(array)]);
++        for ty in [array, nested] {
++            let error =
++                user_location_output_type(&mut ctx, ty).expect_err("unsupported half aggregate");
++            assert!(error.contains("half aggregate stage interface"));
++        }
++        let float = ctx.ty_float();
++        let float_array = ctx.ty_array(float, 2);
++        assert_eq!(
++            user_location_output_type(&mut ctx, float_array).unwrap(),
++            float_array
++        );
++    }
++}
+--- a/src/passes/value_queries.rs
++++ b/src/passes/value_queries.rs
+@@ -44,6 +44,100 @@
+         .chain(ctx.module.types_global_values.iter())
+         .find(|g| g.result_id == Some(ty))
+         .cloned()
++}
++
++/// Floating scalar/vector component width and lane count, read from the retained types.
++/// Aggregates do not have a scalar/vector interface contract here.
++pub(in crate::passes) fn float_component_shape(ctx: &Ctx, ty: Word) -> Option<(u32, u32)> {
++    let definition = type_def_of(ctx, ty)?;
++    let (scalar, lanes) = if definition.class.opcode == Op::TypeVector {
++        match definition.operands.as_slice() {
++            [Operand::IdRef(scalar), Operand::LiteralBit32(lanes)] if (2..=4).contains(lanes) => {
++                (*scalar, *lanes)
++            }
++            _ => return None,
++        }
++    } else {
++        (ty, 1)
++    };
++    let scalar = type_def_of(ctx, scalar)?;
++    if scalar.class.opcode != Op::TypeFloat {
++        return None;
++    }
++    match scalar.operands.as_slice() {
++        [Operand::LiteralBit32(bits)] => Some((*bits, lanes)),
++        _ => None,
++    }
++}
++
++/// Core Vulkan stage transport for AIR half scalar/vector values.
++///
++/// `shaderFloat16` permits half arithmetic but does not imply `storageInputOutput16`.
++/// Use float32 at the stage boundary, retaining the AIR value type in the body and
++/// numerically converting on each boundary load/store. This leaves buffer layouts,
++/// arithmetic precision, locations and interpolation qualifiers unchanged.
++pub(in crate::passes) fn portable_stage_float_type(
++    ctx: &mut Ctx,
++    ty: Word,
++) -> Result<Word, String> {
++    match float_component_shape(ctx, ty) {
++        Some((16, 1)) => return Ok(ctx.ty_float()),
++        Some((16, lanes)) => return Ok(ctx.ty_vecf(lanes)),
++        _ => {}
++    }
++    if stage_type_contains_half(ctx, ty, &mut HashMap::new(), &mut HashSet::new(), 0)? {
++        return Err(format!(
++            "half aggregate stage interface type {ty} is unsupported: only scalar/vector \
++             half stage transport has a defined numerical conversion"
++        ));
++    }
++    Ok(ty)
++}
++
++fn stage_type_contains_half(
++    ctx: &Ctx,
++    ty: Word,
++    memo: &mut HashMap<Word, bool>,
++    active: &mut HashSet<Word>,
++    depth: usize,
++) -> Result<bool, String> {
++    if let Some(result) = memo.get(&ty) {
++        return Ok(*result);
++    }
++    if depth > 64 || !active.insert(ty) {
++        return Err(format!(
++            "unresolved recursive/deep stage interface type {ty}"
++        ));
++    }
++    let definition =
++        type_def_of(ctx, ty).ok_or_else(|| format!("unresolved stage interface type {ty}"))?;
++    let result = match definition.class.opcode {
++        Op::TypeFloat => match definition.operands.as_slice() {
++            [Operand::LiteralBit32(bits)] => *bits == 16,
++            _ => return Err(format!("unresolved floating stage interface type {ty}")),
++        },
++        Op::TypeInt | Op::TypeBool => false,
++        Op::TypeVector | Op::TypeMatrix | Op::TypeArray | Op::TypeRuntimeArray => {
++            let Some(Operand::IdRef(element)) = definition.operands.first() else {
++                return Err(format!("unresolved aggregate stage interface type {ty}"));
++            };
++            stage_type_contains_half(ctx, *element, memo, active, depth + 1)?
++        }
++        Op::TypeStruct => {
++            let mut contains = false;
++            for member in &definition.operands {
++                let Operand::IdRef(member) = member else {
++                    return Err(format!("unresolved struct stage interface type {ty}"));
++                };
++                contains |= stage_type_contains_half(ctx, *member, memo, active, depth + 1)?;
++            }
++            contains
++        }
++        _ => return Err(format!("unsupported stage interface type {ty}")),
++    };
++    active.remove(&ty);
++    memo.insert(ty, result);
++    Ok(result)
+ }
+ 
+ /// Find the defining instruction for a value id in globals, parameters, or function bodies.
+--- /dev/null
++++ b/tests/half_stage_io.rs
+@@ -0,0 +1,158 @@
++//! Half precision belongs to the AIR program, while portable Vulkan stage transport is float32.
++
++use metal2vulkan::passes::Stage;
++use metal2vulkan::{disassemble, translate_sanitized_native};
++use std::collections::HashMap;
++
++const VERTEX: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
++define <{ <4 x float>, <4 x half> }> @vert(<4 x float> %pos, <4 x half> %varying) {
++entry:
++  %h = fadd <4 x half> %varying, <half 0xH0000, half 0xH0000, half 0xH0000, half 0xH0000>
++  %r0 = insertvalue <{ <4 x float>, <4 x half> }> undef, <4 x float> %pos, 0
++  %r1 = insertvalue <{ <4 x float>, <4 x half> }> %r0, <4 x half> %h, 1
++  ret <{ <4 x float>, <4 x half> }> %r1
++}
++!air.vertex = !{!0}
++!0 = !{ptr @vert, !1, !4}
++!1 = !{!2, !3}
++!2 = !{!"air.position", !"air.invariant", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
++!3 = !{!"air.vertex_output", !"generated(varying)", !"air.arg_type_name", !"half4", !"air.arg_name", !"varying"}
++!4 = !{!5, !6}
++!5 = !{i32 0, !"air.vertex_input", !"air.location_index", i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"pos"}
++!6 = !{i32 1, !"air.vertex_input", !"air.location_index", i32 1, !"air.arg_type_name", !"half4", !"air.arg_name", !"varying"}
++"#;
++
++const FRAGMENT: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
++define <4 x half> @frag(<4 x half> %varying) {
++entry:
++  %h = fadd <4 x half> %varying, <half 0xH0000, half 0xH0000, half 0xH0000, half 0xH0000>
++  ret <4 x half> %h
++}
++!air.fragment = !{!0}
++!0 = !{ptr @frag, !1, !3}
++!1 = !{!2}
++!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
++!3 = !{!4}
++!4 = !{i32 0, !"air.fragment_input", !"generated(varying)", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"half4", !"air.arg_name", !"varying"}
++"#;
++
++fn translate(source: &str, stage: Stage, name: &str) -> String {
++    let tmp =
++        std::env::temp_dir().join(format!("m2v_half_stage_io_{}_{}", std::process::id(), name));
++    std::fs::create_dir_all(&tmp).expect("create scratch");
++    let words =
++        translate_sanitized_native(source, stage, &tmp).expect("translate through native owner");
++    let asm = disassemble(&words).expect("disassemble validated product module");
++    std::fs::remove_dir_all(tmp).expect("remove scratch");
++    asm
++}
++
++fn assert_float32_interfaces(asm: &str, minimum: usize) {
++    let definitions: HashMap<&str, Vec<&str>> = asm
++        .lines()
++        .filter_map(|line| {
++            let (id, value) = line.trim().split_once(" = ")?;
++            Some((id, value.split_whitespace().collect()))
++        })
++        .collect();
++    let mut interfaces = 0;
++    for def in definitions.values() {
++        if def.first() != Some(&"OpVariable")
++            || !matches!(def.get(2).copied(), Some("Input" | "Output"))
++        {
++            continue;
++        }
++        interfaces += 1;
++        let ptr = &definitions[def[1]];
++        assert_eq!(ptr[0], "OpTypePointer");
++        let mut scalar = &definitions[ptr[2]];
++        if scalar[0] == "OpTypeVector" {
++            scalar = &definitions[scalar[1]];
++        }
++        assert_eq!(
++            scalar.as_slice(),
++            ["OpTypeFloat", "32"],
++            "stage variable retains unsupported half transport:\n{asm}"
++        );
++    }
++    assert!(
++        interfaces >= minimum,
++        "fixture did not retain expected interfaces"
++    );
++    assert!(
++        asm.contains("OpTypeFloat 16"),
++        "half program type was erased"
++    );
++    assert!(
++        definitions.values().any(|def| {
++            def.first() == Some(&"OpFAdd") && floating_width(&definitions, def[1]) == Some(16)
++        }),
++        "half arithmetic was erased: {asm}"
++    );
++    assert!(!asm.contains("StorageInputOutput16"));
++}
++
++fn floating_width(definitions: &HashMap<&str, Vec<&str>>, ty: &str) -> Option<u32> {
++    let mut definition = definitions.get(ty)?;
++    if definition.first() == Some(&"OpTypeVector") {
++        definition = definitions.get(definition.get(1)?)?;
++    }
++    if definition.first() != Some(&"OpTypeFloat") {
++        return None;
++    }
++    definition.get(1)?.parse().ok()
++}
++
++#[test]
++fn vertex_half_input_and_output_use_numeric_boundary_conversions() {
++    let asm = translate(VERTEX, Stage::Vertex, "vertex");
++    assert_float32_interfaces(&asm, 4);
++    assert!(
++        asm.lines()
++            .filter(|line| line.contains("OpFConvert"))
++            .count()
++            >= 2
++    );
++    assert!(asm.contains("BuiltIn Position"));
++    assert!(asm.contains("Invariant"));
++}
++
++#[test]
++fn fragment_half_input_and_output_keep_half_arithmetic_and_interpolation() {
++    let asm = translate(FRAGMENT, Stage::Fragment, "fragment");
++    assert_float32_interfaces(&asm, 2);
++    assert!(
++        asm.lines()
++            .filter(|line| line.contains("OpFConvert"))
++            .count()
++            >= 2
++    );
++    assert!(asm.contains("NoPerspective"));
++}
++
++#[test]
++fn half_array_varying_is_an_explicit_fallback() {
++    let source = r#"target triple = "air64_v28-apple-macosx26.5.0"
++define <4 x half> @frag([2 x half] %varying) {
++entry:
++  %h = extractvalue [2 x half] %varying, 0
++  %r0 = insertelement <4 x half> zeroinitializer, half %h, i32 0
++  ret <4 x half> %r0
++}
++!air.fragment = !{!0}
++!0 = !{ptr @frag, !1, !3}
++!1 = !{!2}
++!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
++!3 = !{!4}
++!4 = !{i32 0, !"air.fragment_input", !"generated(varying)", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"half2", !"air.arg_name", !"varying"}
++"#;
++    let tmp = std::env::temp_dir().join(format!("m2v_half_array_{}", std::process::id()));
++    std::fs::create_dir(&tmp).expect("scratch");
++    let error =
++        translate_sanitized_native(source, Stage::Fragment, &tmp).expect_err("half array fallback");
++    std::fs::remove_dir_all(tmp).expect("remove scratch");
++    assert!(
++        error.contains("half aggregate stage interface"),
++        "wrong refusal: {error}"
++    );
++}

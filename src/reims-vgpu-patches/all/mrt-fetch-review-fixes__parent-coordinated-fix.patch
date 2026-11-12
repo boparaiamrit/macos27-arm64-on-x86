@@ -1,0 +1,1162 @@
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/color_input.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/color_input.rs
+@@ -11,6 +11,7 @@
+     InvalidIndex(ColorInputIndexError),
+     OrderedAccessUnavailable,
+     PhysicalCapacity { requested: usize, limit: u32 },
++    StageSpan { requested: usize, limit: u32 },
+     DescriptorCapacity { requested: u32, limit: u32 },
+     MissingAttachment { index: usize },
+ }
+@@ -20,6 +21,7 @@
+             Self::InvalidIndex(_) => "color_input_index_out_of_range",
+             Self::OrderedAccessUnavailable => "color_input_ordered_access_unavailable",
+             Self::PhysicalCapacity { .. } => "color_input_attachment_capacity",
++            Self::StageSpan { .. } => "color_input_stage_span",
+             Self::DescriptorCapacity { .. } => "color_input_descriptor_capacity",
+             Self::MissingAttachment { .. } => "color_input_attachment_missing",
+         }
+@@ -31,6 +33,10 @@
+             Self::PhysicalCapacity { requested, limit } => vec![
+                 ("requested", requested.to_string()),
+                 ("limit", limit.to_string()),
++            ],
++            Self::StageSpan { requested, limit } => vec![
++                ("span", requested.to_string()),
++                ("stage_limit", limit.to_string()),
+             ],
+             Self::DescriptorCapacity { requested, limit } => vec![
+                 ("requested", requested.to_string()),
+@@ -63,6 +69,12 @@
+                 limit: caps.max_color_attachments,
+             }));
+         }
++        if inputs.span() > caps.input_attachment_stage_limit as usize {
++            return Err(refusal(ColorInputDecline::StageSpan {
++                requested: inputs.span(),
++                limit: caps.input_attachment_stage_limit,
++            }));
++        }
+         if inputs.count() > caps.input_attachment_descriptor_limit {
+             return Err(refusal(ColorInputDecline::DescriptorCapacity {
+                 requested: inputs.count(),
+@@ -111,6 +123,7 @@
+             &DeviceFeatures {
+                 ordered_color_attachment_access: true,
+                 max_color_attachments: 8,
++                input_attachment_stage_limit: 8,
+                 input_attachment_descriptor_limit: 8,
+                 ..Default::default()
+             },
+@@ -135,6 +148,7 @@
+         let on = DeviceFeatures {
+             ordered_color_attachment_access: true,
+             max_color_attachments: 8,
++            input_attachment_stage_limit: 8,
+             input_attachment_descriptor_limit: 1,
+             ..Default::default()
+         };
+@@ -170,10 +184,65 @@
+         let caps = DeviceFeatures {
+             ordered_color_attachment_access: true,
+             max_color_attachments: 8,
++            input_attachment_stage_limit: 4,
+             input_attachment_descriptor_limit: 4,
+             ..Default::default()
+         };
+-        assert!(OrderedColorInputs::admit(ColorInputs::parse([7]).unwrap(), &caps, 8).is_err(),
+-                "one descriptor still requires eight input-reference table entries");
+-    }
+-}
++        assert!(
++            OrderedColorInputs::admit(ColorInputs::parse([7]).unwrap(), &caps, 8).is_err(),
++            "one descriptor still requires eight input-reference table entries"
++        );
++    }
++}
++
++#[cfg(test)]
++mod parent_review_asymmetric_limits {
++    use super::*;
++    fn caps(stage: u32, count: u32) -> DeviceFeatures {
++        DeviceFeatures {
++            ordered_color_attachment_access: true,
++            max_color_attachments: 8,
++            input_attachment_stage_limit: stage,
++            input_attachment_descriptor_limit: count,
++            ..Default::default()
++        }
++    }
++    #[test]
++    fn parent_review_stage_span_and_descriptor_count_have_different_units() {
++        let seven = ColorInputs::parse([7]).unwrap();
++        assert!(OrderedColorInputs::admit(seven, &caps(8, 1), 8).is_ok());
++        assert_eq!(
++            OrderedColorInputs::admit(seven, &caps(4, 4), 8),
++            Err(refusal(ColorInputDecline::StageSpan {
++                requested: 8,
++                limit: 4
++            }))
++        );
++        assert!(
++            OrderedColorInputs::admit(ColorInputs::parse([3]).unwrap(), &caps(4, 4), 8).is_ok()
++        );
++        assert_eq!(
++            OrderedColorInputs::admit(ColorInputs::parse([4]).unwrap(), &caps(4, 4), 8),
++            Err(refusal(ColorInputDecline::StageSpan {
++                requested: 5,
++                limit: 4
++            }))
++        );
++        assert_eq!(
++            OrderedColorInputs::admit(ColorInputs::parse([0, 1]).unwrap(), &caps(8, 1), 8),
++            Err(refusal(ColorInputDecline::DescriptorCapacity {
++                requested: 2,
++                limit: 1
++            }))
++        );
++        assert_eq!(
++            OrderedColorInputs::admit(seven, &caps(8, 1), 7),
++            Err(refusal(ColorInputDecline::MissingAttachment { index: 7 }))
++        );
++        assert!(ColorInputs::parse([8]).is_err());
++        assert!(
++            OrderedColorInputs::admit(ColorInputs::default(), &DeviceFeatures::default(), 100)
++                .is_ok()
++        );
++    }
++}
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+@@ -507,6 +507,57 @@
+                 ash::vk::AttachmentLoadOp::DONT_CARE,
+                 ash::vk::ImageLayout::UNDEFINED,
+             ),
++        }
++    }
++}
++
++/// Scope of the optional diagnostic pass/layout churn experiment.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum ProbeScopeDecline {
++    PassChurn {
++        preserves: bool,
++        colors: usize,
++        depth: bool,
++        samples: u32,
++        resolve: bool,
++        feedback: bool,
++    },
++    LayoutChurn {
++        host_accessible: bool,
++        feedback: bool,
++    },
++}
++impl crate::observe::Decline for ProbeScopeDecline {
++    fn slug(&self) -> &'static str {
++        match self {
++            Self::PassChurn { .. } => "pass_churn_scope_unsupported",
++            Self::LayoutChurn { .. } => "layout_churn_scope_unsupported",
++        }
++    }
++    fn fields(&self) -> Vec<(&'static str, String)> {
++        match self {
++            Self::PassChurn {
++                preserves,
++                colors,
++                depth,
++                samples,
++                resolve,
++                feedback,
++            } => vec![
++                ("preserves", preserves.to_string()),
++                ("colors", colors.to_string()),
++                ("depth", depth.to_string()),
++                ("samples", samples.to_string()),
++                ("resolve", resolve.to_string()),
++                ("feedback", feedback.to_string()),
++            ],
++            Self::LayoutChurn {
++                host_accessible,
++                feedback,
++            } => vec![
++                ("host_accessible", host_accessible.to_string()),
++                ("feedback", feedback.to_string()),
++            ],
+         }
+     }
+ }
+@@ -643,8 +694,45 @@
+         FramebufferCompatibilityKey(key)
+     }
+ 
++    /// The empty restart is pixel-neutral only for this bounded preserving scope.
++    pub(crate) fn admit_diagnostic_probes(
++        self,
++        pass_churn: bool,
++        layout_churn: bool,
++    ) -> Result<(), DrawError> {
++        let preserves = self.color0_load == Color0Load::Preserve;
++        if pass_churn
++            && (!preserves
++                || self.secondary_count != 0
++                || self.depth.is_some()
++                || self.sample_count != 1
++                || self.multisample_resolve
++                || self.feedback_colors != 0)
++        {
++            return Err(DrawError::Unsupported(
++                super::reason::DrawReason::ProbeScope(ProbeScopeDecline::PassChurn {
++                    preserves,
++                    colors: 1 + self.secondary_count as usize,
++                    depth: self.depth.is_some(),
++                    samples: self.sample_count,
++                    resolve: self.multisample_resolve,
++                    feedback: self.feedback_colors != 0,
++                }),
++            ));
++        }
++        if layout_churn && (self.host_accessible_color0 || self.feedback_colors != 0) {
++            return Err(DrawError::Unsupported(
++                super::reason::DrawReason::ProbeScope(ProbeScopeDecline::LayoutChurn {
++                    host_accessible: self.host_accessible_color0,
++                    feedback: self.feedback_colors != 0,
++                }),
++            ));
++        }
++        Ok(())
++    }
++
+     pub(crate) fn primary_load_ops(self) -> (vk::AttachmentLoadOp, vk::ImageLayout) {
+-        self.color0_load.ops(self.color_final_layout(0))
++        self.color0_load.ops(self.color_layout(0))
+     }
+ 
+     pub(crate) fn color_input_references(self) -> Vec<vk::AttachmentReference> {
+@@ -4592,7 +4680,71 @@
+     fn parent_review_primary_load_names_the_recorded_entry_layout() {
+         let mut key = PassKey::single(Color0Load::Preserve, vk::Format::R8G8B8A8_UNORM);
+         key.color_input = super::super::color_input::OrderedColorInputs::fixture(&[0]);
+-        assert_eq!(key.color_final_layout(0), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, "requires COLOR_GENERAL=off");
+-        assert_eq!(key.primary_load_ops(), (vk::AttachmentLoadOp::LOAD, key.color_layout(0)));
+-    }
+-}
++        assert_eq!(
++            key.color_final_layout(0),
++            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
++            "requires COLOR_GENERAL=off"
++        );
++        assert_eq!(
++            key.primary_load_ops(),
++            (vk::AttachmentLoadOp::LOAD, key.color_layout(0))
++        );
++    }
++}
++
++#[cfg(test)]
++mod parent_review_probe_scope_tests {
++    use super::*;
++    #[test]
++    fn parent_review_probe_scope_refuses_full_mrt_restart_before_recording() {
++        let base = PassKey::single(Color0Load::Preserve, vk::Format::R8G8B8A8_UNORM);
++        assert!(base.admit_diagnostic_probes(true, false).is_ok());
++        let mut shapes = Vec::new();
++        for load in [false, true] {
++            let mut k = base;
++            k.secondary_count = 1;
++            k.secondary[0] = SecondaryAttachKey {
++                format: vk::Format::R8G8B8A8_UNORM,
++                load,
++            };
++            shapes.push(k);
++        }
++        for stencil in [false, true] {
++            let mut k = base;
++            k.depth = Some(DepthAttachKey {
++                load: false,
++                stencil,
++            });
++            shapes.push(k);
++        }
++        for load in [Color0Load::Clear, Color0Load::Undefined] {
++            let mut k = base;
++            k.color0_load = load;
++            shapes.push(k);
++        }
++        let mut msaa = base;
++        msaa.sample_count = 4;
++        shapes.push(msaa);
++        let mut resolve = base;
++        resolve.multisample_resolve = true;
++        shapes.push(resolve);
++        let mut feedback = base;
++        feedback.feedback_colors = 1;
++        shapes.push(feedback);
++        for k in shapes {
++            assert!(k.admit_diagnostic_probes(false, false).is_ok());
++            assert!(matches!(
++                k.admit_diagnostic_probes(true, false),
++                Err(DrawError::Unsupported(
++                    super::super::reason::DrawReason::ProbeScope(
++                        ProbeScopeDecline::PassChurn { .. }
++                    )
++                ))
++            ));
++        }
++        let mut host = base;
++        host.host_accessible_color0 = true;
++        assert!(host.admit_diagnostic_probes(false, true).is_err());
++        assert!(feedback.admit_diagnostic_probes(false, true).is_err());
++    }
++}
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -3192,6 +3192,7 @@
+     }
+     pass_key.sample_count = raster_sample_count;
+     pass_key.multisample_resolve = req.multisample_resolve;
++    pass_key.admit_diagnostic_probes(pass_churn_probe_enabled(), layout_churn_probe_enabled())?;
+     // Into the command buffer's scratch and then interned, for the reason the
+     // layout bindings below are: `PipelineKey` carries the attribute set, and a
+     // key owning a `Vec<AttrKey>` is a heap allocation on every draw that has
+@@ -5493,7 +5494,7 @@
+         let out = [vk::ImageMemoryBarrier::default()
+             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+             .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+-            .old_layout(super::caches::color0_pass_exit_layout())
++            .old_layout(pass_key.color_final_layout(0))
+             .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+             .image(target_image)
+             .subresource_range(super::color_subresource_range())];
+@@ -5510,7 +5511,7 @@
+             .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+             .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+-            .new_layout(super::caches::color0_pass_exit_layout())
++            .new_layout(pass_key.color_final_layout(0))
+             .image(target_image)
+             .subresource_range(super::color_subresource_range())];
+         ctx.device.cmd_pipeline_barrier(
+@@ -5547,7 +5548,10 @@
+         // `registry_mark_ready_at`'s claim about this resident stays true — that
+         // call runs below and records the pass's exit layout unconditionally.
+         let (to_transfer, back_to_exit) = primary_readback_barriers(
+-            pass_key, target_read_layout, target_image, target_dst_access,
++            pass_key,
++            target_read_layout,
++            target_image,
++            target_dst_access,
+         );
+         ctx.device.cmd_pipeline_barrier(
+             cb,
+@@ -6448,8 +6452,11 @@
+     target_read_layout: vk::ImageLayout,
+     target_image: vk::Image,
+     target_dst_access: vk::AccessFlags,
+-) -> ([vk::ImageMemoryBarrier<'static>; 1], [vk::ImageMemoryBarrier<'static>; 1]) {
+-    let target_pass_layout = key.color_layout(0);
++) -> (
++    [vk::ImageMemoryBarrier<'static>; 1],
++    [vk::ImageMemoryBarrier<'static>; 1],
++) {
++    let target_pass_layout = key.color_final_layout(0);
+     let to_transfer = [vk::ImageMemoryBarrier::default()
+         .src_access_mask(target_dst_access)
+         .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+@@ -6471,21 +6478,25 @@
+     key: super::caches::PassKey,
+     target_image: vk::Image,
+ ) -> [vk::ImageMemoryBarrier<'static>; 1] {
+-    let target_pass_layout = key.color_layout(0);
++    let target_pass_layout = key.color_final_layout(0);
+     let back = [vk::ImageMemoryBarrier::default()
+         .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+         .dst_access_mask(
+-        vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
++            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+         )
+         .old_layout(target_pass_layout)
+-        .new_layout(target_pass_layout)
++        .new_layout(key.color_layout(0))
+         .image(target_image)
+         .subresource_range(super::color_subresource_range())];
+     back
+ }
+ 
+-fn pass_exit_needs_no_barrier(prior: super::pools::ResidentAccess, _next_layout: vk::ImageLayout) -> bool {
++fn pass_exit_needs_no_barrier(
++    prior: super::pools::ResidentAccess,
++    next_layout: vk::ImageLayout,
++) -> bool {
+     prior == super::pools::ResidentAccess::ColorWrite(super::caches::color0_pass_exit_layout())
++        && prior.layout() == next_layout
+ }
+ 
+ /// Record the barrier that makes a registry-resident image readable as a
+@@ -8050,14 +8061,20 @@
+             let skippable = tracked
+                 == ResidentAccess::ColorWrite(super::super::caches::color0_pass_exit_layout());
+             assert_eq!(
+-                pass_exit_needs_no_barrier(tracked, super::super::caches::color0_pass_exit_layout()),
++                pass_exit_needs_no_barrier(
++                    tracked,
++                    super::super::caches::color0_pass_exit_layout()
++                ),
+                 skippable,
+                 "{tracked:?}"
+             );
+             // A snapshot is this draw's own transfer read and always needs the
+             // transition back, whatever the registry was tracking.
+             assert!(
+-                !pass_exit_needs_no_barrier(target_prior_access(true, tracked, false), super::super::caches::color0_pass_exit_layout()),
++                !pass_exit_needs_no_barrier(
++                    target_prior_access(true, tracked, false),
++                    super::super::caches::color0_pass_exit_layout()
++                ),
+                 "a snapshotted {tracked:?} target still has to come back from TRANSFER_SRC"
+             );
+         }
+@@ -8692,16 +8709,26 @@
+     use super::*;
+     fn selected_key() -> super::super::caches::PassKey {
+         let mut key = super::super::caches::PassKey::single(
+-            super::super::caches::Color0Load::Preserve, vk::Format::R8G8B8A8_UNORM);
++            super::super::caches::Color0Load::Preserve,
++            vk::Format::R8G8B8A8_UNORM,
++        );
+         key.color_input = super::super::color_input::OrderedColorInputs::fixture(&[0]);
+-        assert_eq!(key.color_final_layout(0), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, "requires COLOR_GENERAL=off");
++        assert_eq!(
++            key.color_final_layout(0),
++            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
++            "requires COLOR_GENERAL=off"
++        );
+         key
+     }
+     #[test]
+     fn parent_review_readback_starts_and_restores_the_actual_pass_exit() {
+         let key = selected_key();
+-        let (to, back) = primary_readback_barriers(key, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+-            vk::Image::null(), vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
++        let (to, back) = primary_readback_barriers(
++            key,
++            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
++            vk::Image::null(),
++            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
++        );
+         assert_eq!(to[0].old_layout, key.color_final_layout(0));
+         assert_eq!(back[0].new_layout, key.color_final_layout(0));
+         assert_eq!(to[0].new_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+@@ -8711,7 +8738,9 @@
+     fn parent_review_ready_primary_transitions_when_next_pass_layout_differs() {
+         let key = selected_key();
+         assert!(!pass_exit_needs_no_barrier(
+-            super::super::pools::ResidentAccess::ColorWrite(key.color_final_layout(0)), key.color_layout(0)));
++            super::super::pools::ResidentAccess::ColorWrite(key.color_final_layout(0)),
++            key.color_layout(0)
++        ));
+     }
+     #[test]
+     fn parent_review_empty_restart_uses_final_to_entry_transition() {
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/reason.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/reason.rs
+@@ -34,6 +34,7 @@
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum DrawReason {
+     ColorInput(super::color_input::ColorInputDecline),
++    ProbeScope(super::caches::ProbeScopeDecline),
+     /// A validator rejected the SPIR-V module this device assembled, so it was
+     /// never handed to the driver.
+     ///
+@@ -333,6 +334,7 @@
+     fn slug(&self) -> &'static str {
+         match self {
+             Self::ColorInput(r) => r.slug(),
++            Self::ProbeScope(r) => r.slug(),
+             Self::SpirvInvalid => "spirv_module_invalid",
+             Self::UsedBindingAbsentFromLayout { .. } => "draw_used_binding_absent_from_layout",
+             Self::DriverCallQuarantined => "driver_call_quarantined",
+@@ -407,6 +409,12 @@
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         write!(f, "reason={}", self.slug())?;
+         match self {
++            Self::ProbeScope(r) => {
++                for (k, v) in r.fields() {
++                    write!(f, " {k}={v}")?;
++                }
++                Ok(())
++            }
+             Self::ColorInput(r) => {
+                 for (k, v) in r.fields() {
+                     write!(f, " {k}={v}")?;
+--- a/crates/reims-vgpu/src/backend/vulkan/caps/device_features.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/caps/device_features.rs
+@@ -315,6 +315,8 @@
+     /// Advertised EXT query result, enabled by the matching device feature chain.
+     pub ordered_color_attachment_access: bool,
+     pub max_color_attachments: u32,
++    /// Raw subpass input-reference table limit; holes still occupy indices.
++    pub input_attachment_stage_limit: u32,
+     pub input_attachment_descriptor_limit: u32,
+     /// `VK_EXT_image_drm_format_modifier`, used only for the explicit linear
+     /// plane layout that gives a shared guest target its declared row pitch.
+@@ -713,6 +715,7 @@
+             attachment_feedback_loop_layout,
+             ordered_color_attachment_access,
+             max_color_attachments,
++            input_attachment_stage_limit,
+             input_attachment_descriptor_limit,
+             image_drm_format_modifier,
+             dual_src_blend,
+@@ -744,7 +747,7 @@
+         format!(
+             "vk_features robust_buffer_access={robust_buffer_access} \
+              image_robustness={image_robustness:?} \
+-             ordered_color_attachment_access={ordered_color_attachment_access} max_color_attachments={max_color_attachments} input_attachment_descriptor_limit={input_attachment_descriptor_limit} \
++             ordered_color_attachment_access={ordered_color_attachment_access} max_color_attachments={max_color_attachments} input_attachment_stage_limit={input_attachment_stage_limit} input_attachment_descriptor_limit={input_attachment_descriptor_limit} \
+              attachment_feedback_loop_layout={attachment_feedback_loop_layout} \
+              image_drm_format_modifier={image_drm_format_modifier} \
+              sampler_anisotropy={sampler_anisotropy} max_sampler_anisotropy={max_sampler_anisotropy} \
+@@ -1010,6 +1013,7 @@
+         attachment_feedback_loop_layout,
+         ordered_color_attachment_access,
+         max_color_attachments: props.limits.max_color_attachments,
++        input_attachment_stage_limit: props.limits.max_per_stage_descriptor_input_attachments,
+         input_attachment_descriptor_limit: props
+             .limits
+             .max_per_stage_descriptor_input_attachments
+@@ -1139,6 +1143,7 @@
+             attachment_feedback_loop_layout: true,
+             ordered_color_attachment_access: true,
+             max_color_attachments: 8,
++            input_attachment_stage_limit: 8,
+             input_attachment_descriptor_limit: 8,
+             image_drm_format_modifier: true,
+             dual_src_blend: true,
+@@ -1419,6 +1424,7 @@
+             attachment_feedback_loop_layout: true,
+             ordered_color_attachment_access: true,
+             max_color_attachments: 8,
++            input_attachment_stage_limit: 8,
+             input_attachment_descriptor_limit: 8,
+             ..Default::default()
+         };
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/desc_arena.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/desc_arena.rs
+@@ -1,6 +1,6 @@
+ //! Growable descriptor-pool arena.
+ //!
+-//! A single fixed `VkDescriptorPool` hard-fails once its `max_sets` or per-type
++//! A single fixed `VkDescriptorPool` may fail once its `max_sets` or per-type
+ //! descriptor budget is exhausted: `vkAllocateDescriptorSets` returns
+ //! `ERROR_OUT_OF_POOL_MEMORY` / `ERROR_FRAGMENTED_POOL`, the draw's descriptor
+ //! set never allocates, and the whole draw is dropped — a classic cap-cliff
+@@ -130,6 +130,48 @@
+     blocks: Vec<vk::DescriptorPool>,
+ }
+ 
++trait PoolApi {
++    unsafe fn create_pool(
++        &mut self,
++        info: &vk::DescriptorPoolCreateInfo<'_>,
++    ) -> Result<vk::DescriptorPool, vk::Result>;
++    unsafe fn allocate_sets(
++        &mut self,
++        info: &vk::DescriptorSetAllocateInfo<'_>,
++    ) -> Result<Vec<vk::DescriptorSet>, vk::Result>;
++    unsafe fn free_sets(
++        &mut self,
++        pool: vk::DescriptorPool,
++        sets: &[vk::DescriptorSet],
++    ) -> Result<(), vk::Result>;
++    unsafe fn destroy_pool(&mut self, pool: vk::DescriptorPool);
++}
++struct DevicePoolApi<'a>(&'a ash::Device);
++impl PoolApi for DevicePoolApi<'_> {
++    unsafe fn create_pool(
++        &mut self,
++        info: &vk::DescriptorPoolCreateInfo<'_>,
++    ) -> Result<vk::DescriptorPool, vk::Result> {
++        unsafe { self.0.create_descriptor_pool(info, None) }
++    }
++    unsafe fn allocate_sets(
++        &mut self,
++        info: &vk::DescriptorSetAllocateInfo<'_>,
++    ) -> Result<Vec<vk::DescriptorSet>, vk::Result> {
++        unsafe { self.0.allocate_descriptor_sets(info) }
++    }
++    unsafe fn free_sets(
++        &mut self,
++        pool: vk::DescriptorPool,
++        sets: &[vk::DescriptorSet],
++    ) -> Result<(), vk::Result> {
++        unsafe { self.0.free_descriptor_sets(pool, sets) }
++    }
++    unsafe fn destroy_pool(&mut self, pool: vk::DescriptorPool) {
++        unsafe { self.0.destroy_descriptor_pool(pool, None) }
++    }
++}
++
+ impl DescriptorArena {
+     /// Empty arena with no blocks. `create_first_block` (called from the pool
+     /// init that owns a device) brings up `blocks[0]`; before that the arena
+@@ -144,13 +186,21 @@
+         &mut self,
+         device: &ash::Device,
+     ) -> Result<(), DrawError> {
++        unsafe { self.create_first_with(&mut DevicePoolApi(device)) }
++    }
++
++    unsafe fn create_first_with(&mut self, api: &mut impl PoolApi) -> Result<(), DrawError> {
+         debug_assert!(self.blocks.is_empty(), "arena already initialized");
+-        let pool = Self::create_block(device)?;
++        let pool = unsafe { Self::create_block_with(api)? };
+         self.blocks.push(pool);
+         Ok(())
+     }
+ 
+     unsafe fn create_block(device: &ash::Device) -> Result<vk::DescriptorPool, DrawError> {
++        unsafe { Self::create_block_with(&mut DevicePoolApi(device)) }
++    }
++
++    unsafe fn create_block_with(api: &mut impl PoolApi) -> Result<vk::DescriptorPool, DrawError> {
+         let input_budget = (reims_vgpu_core::pass::COLOR_ATTACHMENTS as u32)
+             .checked_mul(DESC_BLOCK_MAX_SETS)
+             .expect("bounded input slots and pool sets");
+@@ -171,15 +221,13 @@
+                 .ty(vk::DescriptorType::SAMPLER)
+                 .descriptor_count(DESC_BLOCK_PER_TYPE),
+         ];
+-        device
+-            .create_descriptor_pool(
+-                &vk::DescriptorPoolCreateInfo::default()
+-                    .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+-                    .max_sets(DESC_BLOCK_MAX_SETS)
+-                    .pool_sizes(&pool_sizes),
+-                None,
+-            )
+-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::DescArenaCreatePool, e)))
++        api.create_pool(
++            &vk::DescriptorPoolCreateInfo::default()
++                .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
++                .max_sets(DESC_BLOCK_MAX_SETS)
++                .pool_sizes(&pool_sizes),
++        )
++        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::DescArenaCreatePool, e)))
+     }
+ 
+     /// Allocate one descriptor set for `dsl`. Tries each existing block
+@@ -195,12 +243,20 @@
+         device: &ash::Device,
+         dsl: vk::DescriptorSetLayout,
+     ) -> Result<(vk::DescriptorSet, vk::DescriptorPool, bool), DrawError> {
++        unsafe { self.allocate_with(&mut DevicePoolApi(device), dsl) }
++    }
++
++    unsafe fn allocate_with(
++        &mut self,
++        api: &mut impl PoolApi,
++        dsl: vk::DescriptorSetLayout,
++    ) -> Result<(vk::DescriptorSet, vk::DescriptorPool, bool), DrawError> {
+         let layouts = [dsl];
+         for &pool in self.blocks.iter().rev() {
+             let info = vk::DescriptorSetAllocateInfo::default()
+                 .descriptor_pool(pool)
+                 .set_layouts(&layouts);
+-            match device.allocate_descriptor_sets(&info) {
++            match api.allocate_sets(&info) {
+                 Ok(sets) => return Ok((sets[0], pool, false)),
+                 Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY)
+                 | Err(vk::Result::ERROR_FRAGMENTED_POOL) => continue,
+@@ -209,11 +265,11 @@
+         }
+         // Every existing block is full (or the arena is empty pre-init and this
+         // is the first allocation) — grow.
+-        let pool = Self::create_block(device)?;
++        let pool = Self::create_block_with(api)?;
+         let info = vk::DescriptorSetAllocateInfo::default()
+             .descriptor_pool(pool)
+             .set_layouts(&layouts);
+-        match device.allocate_descriptor_sets(&info) {
++        match api.allocate_sets(&info) {
+             Ok(sets) => {
+                 self.blocks.push(pool);
+                 Ok((sets[0], pool, true))
+@@ -227,7 +283,7 @@
+                 // actually satisfy. `MAX_SET_DESCRIPTORS_PER_TYPE` is the
+                 // compile-time half of the same rule; this is the half that
+                 // survives a driver whose own per-set limit is lower than ours.
+-                device.destroy_descriptor_pool(pool, None);
++                api.destroy_pool(pool);
+                 if matches!(
+                     error,
+                     vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL
+@@ -252,12 +308,20 @@
+         device: &ash::Device,
+         sets: &[(vk::DescriptorSet, vk::DescriptorPool)],
+     ) {
++        unsafe { self.free_with(&mut DevicePoolApi(device), sets) }
++    }
++
++    unsafe fn free_with(
++        &self,
++        api: &mut impl PoolApi,
++        sets: &[(vk::DescriptorSet, vk::DescriptorPool)],
++    ) {
+         if sets.is_empty() {
+             return;
+         }
+         for (pool, group) in group_by_pool(&self.blocks, sets) {
+             if !group.is_empty() {
+-                if let Err(error) = free_sets_call(device.free_descriptor_sets(pool, &group)) {
++                if let Err(error) = free_sets_call(api.free_sets(pool, &group)) {
+                     crate::observe::Emit::decline("desc_arena_free", &error)
+                         .field("sets", group.len())
+                         .fail_once(pool.as_raw());
+@@ -273,8 +337,11 @@
+     }
+ 
+     pub(crate) unsafe fn destroy(&mut self, device: &ash::Device) {
++        unsafe { self.destroy_with(&mut DevicePoolApi(device)) }
++    }
++    unsafe fn destroy_with(&mut self, api: &mut impl PoolApi) {
+         for pool in self.blocks.drain(..) {
+-            device.destroy_descriptor_pool(pool, None);
++            unsafe { api.destroy_pool(pool) };
+         }
+     }
+ }
+@@ -375,96 +442,12 @@
+ mod device_tests {
+     use super::*;
+     use crate::backend::vulkan::engine::context::DeviceContext;
+-    use ash::vk::Handle;
+-
+-    /// A set no block can serve must be refused *without* growing the arena.
+-    ///
+-    /// Growth is the right answer to a full block and the wrong one to a set an
+-    /// empty block already refuses: the retry fails for the reason the first
+-    /// attempt did, so the arena used to append a pool it could never allocate
+-    /// from and do it again on the next identical draw — host memory climbing
+-    /// per draw with every one of those draws still dropped. Retried below so a
+-    /// single retained block cannot pass as none.
+-    ///
+-    /// The set asks for a type the block carries no budget for at all, which is
+-    /// the cheapest way to make a fresh block refuse. **Whether it does is
+-    /// driver-dependent**, and per-type budgets are advisory in practice: on the
+-    /// NVIDIA proprietary driver this repository's Linux host runs, descriptors
+-    /// are sub-allocated from a general heap and every one of these allocations
+-    /// succeeds — a pool declaring no `UNIFORM_BUFFER` at all still serves one.
+-    /// Mesa's RADV and ANV do account per type. So this asserts the invariant
+-    /// only once the driver has produced the condition, and says plainly when it
+-    /// did not; it is a live gate on a strict driver and inert on a lenient one.
+-    #[test]
+-    fn a_set_no_block_can_serve_is_refused_without_growing_the_arena() {
++    use ash::vk::Handle as _;
++    #[test]
++    fn arena_real_driver_allocates_distinct_sets_and_frees_owners() {
+         crate::observe::redirect_logs_for_tests();
+-        let mut ctx = match unsafe { DeviceContext::create() } {
+-            Ok(c) => c,
+-            Err(e) => {
+-                eprintln!("SKIP desc arena unservable set: no device ({e})");
+-                return;
+-            }
+-        };
+-        // A type `create_block` declares no budget for.
+-        let bindings = [vk::DescriptorSetLayoutBinding::default()
+-            .binding(0)
+-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+-            .descriptor_count(1)
+-            .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+-        let dsl = unsafe {
+-            ctx.device.create_descriptor_set_layout(
+-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+-                None,
+-            )
+-        }
+-        .expect("create unservable descriptor set layout");
+-
+-        let mut arena = DescriptorArena::empty();
+-        unsafe { arena.create_first_block(&ctx.device) }.expect("first block");
+-        assert_eq!(arena.block_count(), 1);
+-
+-        let mut refusals = 0;
+-        for _ in 0..4 {
+-            if unsafe { arena.allocate(&ctx.device, dsl) }.is_err() {
+-                refusals += 1;
+-                assert_eq!(
+-                    arena.block_count(),
+-                    1,
+-                    "a refused allocation must keep no block"
+-                );
+-            }
+-        }
+-        if refusals == 0 {
+-            eprintln!(
+-                "SKIP desc arena unservable set: this driver does not enforce \
+-                 per-type pool budgets, so the condition cannot be produced"
+-            );
+-        }
+-
+-        unsafe {
+-            ctx.device.destroy_descriptor_set_layout(dsl, None);
+-            arena.destroy(&ctx.device);
+-            ctx.destroy();
+-        }
+-    }
+-
+-    /// The growth mechanism against a real driver: exhausting a block's
+-    /// `max_sets` must append a fresh block and keep allocating (not drop the
+-    /// draw), every set must be a distinct valid handle spanning both blocks,
+-    /// and freeing must route each set to its owning block without a driver
+-    /// fault. Skips cleanly when no GPU / Vulkan is present.
+-    #[test]
+-    fn arena_grows_on_exhaustion_and_frees_route_correctly() {
+-        crate::observe::redirect_logs_for_tests();
+-        let mut ctx = match unsafe { DeviceContext::create() } {
+-            Ok(c) => c,
+-            Err(e) => {
+-                eprintln!("SKIP desc arena growth: no device ({e})");
+-                return;
+-            }
+-        };
+-        // One STORAGE_BUFFER binding per set: each allocation consumes one set
+-        // slot + one per-type descriptor from a block.
++        let mut ctx =
++            unsafe { DeviceContext::create() }.expect("required real-device descriptor smoke");
+         let bindings = [vk::DescriptorSetLayoutBinding::default()
+             .binding(0)
+             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+@@ -476,46 +459,22 @@
+                 None,
+             )
+         }
+-        .expect("create test descriptor set layout");
+-
++        .unwrap();
+         let mut arena = DescriptorArena::empty();
+-        unsafe { arena.create_first_block(&ctx.device) }.expect("first block");
+-        assert_eq!(arena.block_count(), 1, "one block before any growth");
+-
+-        // Allocate two blocks' worth to guarantee at least one growth even if the
+-        // driver holds a few extra sets per pool beyond max_sets.
+-        let n = (DESC_BLOCK_MAX_SETS as usize) * 2;
+-        let mut sets = Vec::with_capacity(n);
+-        let mut grew_seen = false;
+-        for i in 0..n {
+-            let (s, pool, grew) = unsafe { arena.allocate(&ctx.device, dsl) }
+-                .unwrap_or_else(|e| panic!("allocate {i}: {e:?}"));
+-            assert!(!s.is_null(), "allocated set {i} is non-null");
+-            grew_seen |= grew;
+-            sets.push((s, pool));
+-        }
+-        assert!(grew_seen, "exhausting a block must report growth");
+-        assert!(
+-            arena.block_count() >= 2,
+-            "arena grew at least one overflow block (blocks={})",
+-            arena.block_count()
+-        );
+-        let distinct_sets: std::collections::HashSet<u64> =
+-            sets.iter().map(|(s, _)| s.as_raw()).collect();
+-        assert_eq!(distinct_sets.len(), n, "every allocated set is distinct");
+-        let distinct_pools: std::collections::HashSet<u64> =
+-            sets.iter().map(|(_, p)| p.as_raw()).collect();
+-        assert!(
+-            distinct_pools.len() >= 2,
+-            "sets span at least two blocks (pools={})",
+-            distinct_pools.len()
+-        );
+-
+-        // Route every set back to its owning block; a misroute would fault here.
+-        unsafe { arena.free(&ctx.device, &sets) };
++        unsafe { arena.create_first_block(&ctx.device) }.unwrap();
++        let mut sets = Vec::new();
++        for _ in 0..64 {
++            let (set, pool, _) =
++                unsafe { arena.allocate(&ctx.device, dsl) }.expect("actual allocation");
++            assert!(!set.is_null());
++            sets.push((set, pool));
++        }
++        let distinct: std::collections::HashSet<_> = sets.iter().map(|(s, _)| s.as_raw()).collect();
++        assert_eq!(distinct.len(), 64);
+         unsafe {
++            arena.free(&ctx.device, &sets);
++            arena.destroy(&ctx.device);
+             ctx.device.destroy_descriptor_set_layout(dsl, None);
+-            arena.destroy(&ctx.device);
+             ctx.destroy();
+         }
+     }
+@@ -608,3 +567,271 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod deterministic_pool_tests {
++    use super::*;
++    use ash::vk::Handle as _;
++    use std::collections::{HashMap, HashSet, VecDeque};
++    #[derive(Default)]
++    struct ScriptedApi {
++        next_pool: u64,
++        next_set: u64,
++        create_results: VecDeque<Result<(), vk::Result>>,
++        allocate_results: VecDeque<Result<(), vk::Result>>,
++        free_results: VecDeque<Result<(), vk::Result>>,
++        creates: Vec<(u32, u32, Vec<(i32, u32)>)>,
++        allocs: Vec<u64>,
++        frees: Vec<(u64, Vec<u64>)>,
++        destroys: Vec<u64>,
++        live: HashSet<u64>,
++        owners: HashMap<u64, u64>,
++    }
++    impl ScriptedApi {
++        fn new() -> Self {
++            Self {
++                next_pool: 1,
++                next_set: 100,
++                ..Default::default()
++            }
++        }
++    }
++    impl PoolApi for ScriptedApi {
++        unsafe fn create_pool(
++            &mut self,
++            info: &vk::DescriptorPoolCreateInfo<'_>,
++        ) -> Result<vk::DescriptorPool, vk::Result> {
++            let sizes = unsafe {
++                std::slice::from_raw_parts(info.p_pool_sizes, info.pool_size_count as usize)
++            };
++            self.creates.push((
++                info.flags.as_raw(),
++                info.max_sets,
++                sizes
++                    .iter()
++                    .map(|s| (s.ty.as_raw(), s.descriptor_count))
++                    .collect(),
++            ));
++            self.create_results.pop_front().unwrap_or(Ok(()))?;
++            let id = self.next_pool;
++            self.next_pool += 1;
++            assert!(self.live.insert(id));
++            Ok(vk::DescriptorPool::from_raw(id))
++        }
++        unsafe fn allocate_sets(
++            &mut self,
++            info: &vk::DescriptorSetAllocateInfo<'_>,
++        ) -> Result<Vec<vk::DescriptorSet>, vk::Result> {
++            let pool = info.descriptor_pool.as_raw();
++            assert!(self.live.contains(&pool));
++            assert_eq!(info.descriptor_set_count, 1);
++            self.allocs.push(pool);
++            self.allocate_results.pop_front().unwrap_or(Ok(()))?;
++            let id = self.next_set;
++            self.next_set += 1;
++            assert!(self.owners.insert(id, pool).is_none());
++            Ok(vec![vk::DescriptorSet::from_raw(id)])
++        }
++        unsafe fn free_sets(
++            &mut self,
++            pool: vk::DescriptorPool,
++            sets: &[vk::DescriptorSet],
++        ) -> Result<(), vk::Result> {
++            let p = pool.as_raw();
++            self.frees
++                .push((p, sets.iter().map(|s| s.as_raw()).collect()));
++            self.free_results.pop_front().unwrap_or(Ok(()))?;
++            for s in sets {
++                assert_eq!(self.owners.remove(&s.as_raw()), Some(p));
++            }
++            Ok(())
++        }
++        unsafe fn destroy_pool(&mut self, pool: vk::DescriptorPool) {
++            let p = pool.as_raw();
++            assert!(self.live.remove(&p), "pool destroyed exactly once");
++            self.destroys.push(p);
++            self.owners.retain(|_, owner| *owner != p);
++        }
++    }
++    fn dsl() -> vk::DescriptorSetLayout {
++        vk::DescriptorSetLayout::from_raw(0x601)
++    }
++    fn expect_call(e: DrawError, op: VkOp, result: vk::Result) {
++        assert_eq!(e, DrawError::VkCall(VkCall::new(op, result)));
++    }
++    #[test]
++    fn arena_grows_on_exhaustion_and_frees_route_correctly() {
++        for code in [
++            vk::Result::ERROR_OUT_OF_POOL_MEMORY,
++            vk::Result::ERROR_FRAGMENTED_POOL,
++        ] {
++            let mut api = ScriptedApi::new();
++            let mut a = DescriptorArena::empty();
++            unsafe { a.create_first_with(&mut api) }.unwrap();
++            let old = unsafe { a.allocate_with(&mut api, dsl()) }.unwrap();
++            assert!(!old.2);
++            api.allocate_results.extend([Err(code), Ok(())]);
++            let new = unsafe { a.allocate_with(&mut api, dsl()) }.unwrap();
++            assert!(new.2);
++            assert_eq!(a.block_count(), 2);
++            assert_eq!(new.1.as_raw(), 2);
++            assert_eq!(api.allocs, vec![1, 1, 2]);
++            api.allocate_results.extend([Err(code), Ok(())]);
++            let older = unsafe { a.allocate_with(&mut api, dsl()) }.unwrap();
++            assert_eq!(older.1.as_raw(), 1);
++            assert!(!older.2);
++            assert_eq!(api.creates.len(), 2);
++            unsafe {
++                a.free_with(
++                    &mut api,
++                    &[(new.0, new.1), (old.0, old.1), (older.0, older.1)],
++                )
++            };
++            assert_eq!(
++                api.frees,
++                vec![
++                    (1, vec![old.0.as_raw(), older.0.as_raw()]),
++                    (2, vec![new.0.as_raw()])
++                ]
++            );
++            assert!(api.owners.is_empty());
++            unsafe { a.destroy_with(&mut api) };
++            assert_eq!(api.destroys, vec![1, 2]);
++            assert!(api.live.is_empty());
++        }
++    }
++    #[test]
++    fn a_set_no_block_can_serve_is_refused_without_growing_the_arena() {
++        for code in [
++            vk::Result::ERROR_OUT_OF_POOL_MEMORY,
++            vk::Result::ERROR_FRAGMENTED_POOL,
++        ] {
++            let mut api = ScriptedApi::new();
++            let mut a = DescriptorArena::empty();
++            unsafe { a.create_first_with(&mut api) }.unwrap();
++            for _ in 0..3 {
++                api.allocate_results.extend([Err(code), Err(code)]);
++                expect_call(
++                    unsafe { a.allocate_with(&mut api, dsl()) }.unwrap_err(),
++                    VkOp::DescArenaAllocSetsGrown,
++                    code,
++                );
++                assert_eq!(a.block_count(), 1);
++            }
++            assert_eq!(api.destroys, vec![2, 3, 4]);
++            assert!(api.owners.is_empty());
++            unsafe { a.destroy_with(&mut api) };
++            assert_eq!(api.destroys, vec![2, 3, 4, 1]);
++            assert!(api.live.is_empty());
++        }
++    }
++    #[test]
++    fn global_oom_is_not_pool_exhaustion_at_any_allocation_boundary() {
++        for oom in [
++            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
++            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
++        ] {
++            let mut api = ScriptedApi::new();
++            api.create_results.push_back(Err(oom));
++            let mut a = DescriptorArena::empty();
++            expect_call(
++                unsafe { a.create_first_with(&mut api) }.unwrap_err(),
++                VkOp::DescArenaCreatePool,
++                oom,
++            );
++            assert_eq!(a.block_count(), 0);
++            assert!(api.destroys.is_empty());
++            let mut api = ScriptedApi::new();
++            let mut a = DescriptorArena::empty();
++            unsafe { a.create_first_with(&mut api) }.unwrap();
++            api.allocate_results.push_back(Err(oom));
++            expect_call(
++                unsafe { a.allocate_with(&mut api, dsl()) }.unwrap_err(),
++                VkOp::DescArenaAllocSets,
++                oom,
++            );
++            assert_eq!(api.creates.len(), 1);
++            assert!(api.destroys.is_empty());
++            unsafe { a.destroy_with(&mut api) };
++            let mut api = ScriptedApi::new();
++            let mut a = DescriptorArena::empty();
++            unsafe { a.create_first_with(&mut api) }.unwrap();
++            api.allocate_results
++                .push_back(Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY));
++            api.create_results.push_back(Err(oom));
++            expect_call(
++                unsafe { a.allocate_with(&mut api, dsl()) }.unwrap_err(),
++                VkOp::DescArenaCreatePool,
++                oom,
++            );
++            assert_eq!(a.block_count(), 1);
++            assert!(api.destroys.is_empty());
++            unsafe { a.destroy_with(&mut api) };
++            let mut api = ScriptedApi::new();
++            let mut a = DescriptorArena::empty();
++            unsafe { a.create_first_with(&mut api) }.unwrap();
++            api.allocate_results
++                .extend([Err(vk::Result::ERROR_FRAGMENTED_POOL), Err(oom)]);
++            expect_call(
++                unsafe { a.allocate_with(&mut api, dsl()) }.unwrap_err(),
++                VkOp::DescArenaAllocSetsGrown,
++                oom,
++            );
++            assert_eq!(a.block_count(), 1);
++            assert_eq!(api.destroys, vec![2]);
++            unsafe { a.destroy_with(&mut api) };
++            assert_eq!(api.destroys, vec![2, 1]);
++        }
++    }
++    #[test]
++    fn lenient_success_does_not_invent_growth_or_reservation_counters() {
++        let mut api = ScriptedApi::new();
++        let mut a = DescriptorArena::empty();
++        unsafe { a.create_first_with(&mut api) }.unwrap();
++        let mut sets = Vec::new();
++        for _ in 0..DESC_BLOCK_MAX_SETS + 1 {
++            let (s, p, grew) = unsafe { a.allocate_with(&mut api, dsl()) }.unwrap();
++            assert!(!grew);
++            assert_eq!(p.as_raw(), 1);
++            sets.push((s, p));
++        }
++        assert_eq!(a.block_count(), 1);
++        assert_eq!(api.creates.len(), 1);
++        unsafe {
++            a.free_with(&mut api, &sets);
++            a.destroy_with(&mut api)
++        };
++        assert!(api.owners.is_empty());
++    }
++    #[test]
++    fn native_pool_budgets_and_free_failure_routing_are_retained() {
++        let mut api = ScriptedApi::new();
++        let mut a = DescriptorArena::empty();
++        unsafe { a.create_first_with(&mut api) }.unwrap();
++        let info = &api.creates[0];
++        assert_eq!(
++            info.0,
++            vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET.as_raw()
++        );
++        assert_eq!(info.1, DESC_BLOCK_MAX_SETS);
++        assert!(info.2.contains(&(
++            vk::DescriptorType::INPUT_ATTACHMENT.as_raw(),
++            reims_vgpu_core::pass::COLOR_ATTACHMENTS as u32 * DESC_BLOCK_MAX_SETS
++        )));
++        let old = unsafe { a.allocate_with(&mut api, dsl()) }.unwrap();
++        api.allocate_results
++            .extend([Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY), Ok(())]);
++        let new = unsafe { a.allocate_with(&mut api, dsl()) }.unwrap();
++        api.free_results
++            .extend([Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY), Ok(())]);
++        unsafe { a.free_with(&mut api, &[(new.0, new.1), (old.0, old.1)]) };
++        assert_eq!(
++            api.frees,
++            vec![(1, vec![old.0.as_raw()]), (2, vec![new.0.as_raw()])]
++        );
++        assert_eq!(api.owners.get(&old.0.as_raw()), Some(&1));
++        assert!(!api.owners.contains_key(&new.0.as_raw()));
++        unsafe { a.destroy_with(&mut api) };
++        assert!(api.owners.is_empty());
++    }
++}

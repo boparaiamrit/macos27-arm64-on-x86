@@ -1,0 +1,87 @@
+diff --git a/qemu/hw/display/meson.build b/qemu/hw/display/meson.build
+index 8b17fe8..e0243bb 100644
+--- a/qemu/hw/display/meson.build
++++ b/qemu/hw/display/meson.build
+@@ -156,40 +156,49 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
+     reims_vgpu_repo_dir = meson.project_source_root() / '..' / 'reims-vgpu'
+   endif
+   reims_vgpu_abi_header_dir = reims_vgpu_repo_dir / 'crates' / 'reims-vgpu' / 'include'
+-  cargo = find_program('cargo')
+-  reims_vgpu_rust_sys_libs = ['-lm', '-ldl', '-lpthread']
+-  reims_vgpu_cargo_features = '--no-default-features --features backend-vulkan,host-window'
+-  reims_vgpu_link_args = reims_vgpu_rust_sys_libs
+-  # A cross build must hand cargo the same target and C compiler as meson,
+-  # or the host-architecture archive in target/release is linked instead.
+-  reims_vgpu_cargo_env = ''
+-  reims_vgpu_cargo_target = ''
+-  reims_vgpu_built = reims_vgpu_repo_dir / 'target' / 'release' / 'libreims_vgpu.a'
+-  if meson.is_cross_build()
+-    reims_vgpu_rust_triple = host_machine.cpu_family() + '-unknown-linux-gnu'
+-    reims_vgpu_env_triple = reims_vgpu_rust_triple.underscorify()
+-    reims_vgpu_cc = meson.get_compiler('c').cmd_array()[0]
+-    reims_vgpu_cargo_env = 'CC_' + reims_vgpu_env_triple + '="' + reims_vgpu_cc + '" ' + \
+-      'CARGO_TARGET_' + reims_vgpu_env_triple.to_upper() + '_LINKER="' + reims_vgpu_cc + '" '
+-    reims_vgpu_cargo_target = ' --target ' + reims_vgpu_rust_triple
+-    reims_vgpu_built = reims_vgpu_repo_dir / 'target' / reims_vgpu_rust_triple / 'release' / 'libreims_vgpu.a'
++  # Optional prebuilt dependency for isolated builds. The package must name
++  # the same ABI headers and archive; no GPU/runtime features are changed.
++  reims_vgpu_prebuilt = dependency('reims-vgpu', required: false,
++                                  method: 'pkg-config', static: true)
++  if reims_vgpu_prebuilt.found()
++    reims_vgpu_header_dep = reims_vgpu_prebuilt
++    reims_vgpu_dep = reims_vgpu_prebuilt
++  else
++    cargo = find_program('cargo')
++    reims_vgpu_rust_sys_libs = ['-lm', '-ldl', '-lpthread']
++    reims_vgpu_cargo_features = '--no-default-features --features backend-vulkan,host-window'
++    reims_vgpu_link_args = reims_vgpu_rust_sys_libs
++    # A cross build must hand cargo the same target and C compiler as meson,
++    # or the host-architecture archive in target/release is linked instead.
++    reims_vgpu_cargo_env = ''
++    reims_vgpu_cargo_target = ''
++    reims_vgpu_built = reims_vgpu_repo_dir / 'target' / 'release' / 'libreims_vgpu.a'
++    if meson.is_cross_build()
++      reims_vgpu_rust_triple = host_machine.cpu_family() + '-unknown-linux-gnu'
++      reims_vgpu_env_triple = reims_vgpu_rust_triple.underscorify()
++      reims_vgpu_cc = meson.get_compiler('c').cmd_array()[0]
++      reims_vgpu_cargo_env = 'CC_' + reims_vgpu_env_triple + '="' + reims_vgpu_cc + '" ' + \
++        'CARGO_TARGET_' + reims_vgpu_env_triple.to_upper() + '_LINKER="' + reims_vgpu_cc + '" '
++      reims_vgpu_cargo_target = ' --target ' + reims_vgpu_rust_triple
++      reims_vgpu_built = reims_vgpu_repo_dir / 'target' / reims_vgpu_rust_triple / 'release' / 'libreims_vgpu.a'
++    endif
++    reims_vgpu_a = custom_target('reims-vgpu-staticlib',
++      output: 'libreims_vgpu.a',
++      console: true,
++      build_always_stale: true,
++      command: [find_program('sh'), '-c',
++        reims_vgpu_cargo_env + '"' + cargo.full_path() + '" build --release' +
++        reims_vgpu_cargo_target + ' --manifest-path "' +
++        reims_vgpu_repo_dir + '/Cargo.toml" -p reims-vgpu ' + reims_vgpu_cargo_features +
++        ' && ( cmp -s "' + reims_vgpu_built + '" "@OUTPUT@" || cp "' +
++        reims_vgpu_built + '" "@OUTPUT@" )'])
++    reims_vgpu_header_dep = declare_dependency(
++      compile_args: ['-I' + reims_vgpu_abi_header_dir])
++    reims_vgpu_dep = declare_dependency(
++      link_with: reims_vgpu_a,
++      link_args: reims_vgpu_link_args,
++      compile_args: ['-I' + reims_vgpu_abi_header_dir])
+   endif
+-  reims_vgpu_a = custom_target('reims-vgpu-staticlib',
+-    output: 'libreims_vgpu.a',
+-    console: true,
+-    build_always_stale: true,
+-    command: [find_program('sh'), '-c',
+-      reims_vgpu_cargo_env + '"' + cargo.full_path() + '" build --release' +
+-      reims_vgpu_cargo_target + ' --manifest-path "' +
+-      reims_vgpu_repo_dir + '/Cargo.toml" -p reims-vgpu ' + reims_vgpu_cargo_features +
+-      ' && ( cmp -s "' + reims_vgpu_built + '" "@OUTPUT@" || cp "' +
+-      reims_vgpu_built + '" "@OUTPUT@" )'])
+-  reims_vgpu_header_dep = declare_dependency(
+-    compile_args: ['-I' + reims_vgpu_abi_header_dir])
+-  reims_vgpu_dep = declare_dependency(
+-    link_with: reims_vgpu_a,
+-    link_args: reims_vgpu_link_args,
+-    compile_args: ['-I' + reims_vgpu_abi_header_dir])
+   system_ss.add(when: 'CONFIG_REIMS_VGPU',
+     if_true: [files('reims-vgpu-dirty.c', 'reims-vgpu-shim.c'), reims_vgpu_header_dep])
+   specific_ss.add(when: 'CONFIG_REIMS_VGPU',

@@ -1,0 +1,42 @@
+MIT License (Original Scripts, Standalone Tools, Documentation & Diagrams)
+
+Copyright (c) 2026 Amritpal Singh (@boparaiamrit)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+GPL-2.0-or-later Notice for QEMU Integration Modules & Patches:
+Files under `src/qemu-apple-vm-patches/` and QEMU C integration files
+(`src/fastjit-qemu/fastjit-a64.c`, `src/fastjit-qemu/fastjit-a64.h`) are
+derivative/integration works for QEMU and are distributed under the terms of
+the GNU General Public License v2.0 or (at your option) any later version
+(SPDX-License-Identifier: GPL-2.0-or-later).
+
+Upstream `reims-vgpu` Patches:
+Files under `src/reims-vgpu-patches/` are patches against `steelbrain/reims-vgpu`
+and remain subject to its upstream open-source license.
+
+-------------------------------------------------------------------------------
+Research Scope, EULA & Trademark Disclaimer:
+This repository contains ONLY open-source research code and documentation and
+does NOT distribute macOS or any Apple Inc. firmware/assets. Running Apple's
+macOS is subject to Apple's End-User License Agreement (EULA), which permits
+installation and virtualization solely on Apple-branded hardware. This project
+is NOT affiliated with, sponsored by, or endorsed by Apple Inc.
+See `LEGAL.md` for full legal, trademark, and EULA notices.

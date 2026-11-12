@@ -1,0 +1,1299 @@
+diff --git a/crates/reims-vgpu/src/backend/vulkan/caps/host_pointer.rs b/crates/reims-vgpu/src/backend/vulkan/caps/host_pointer.rs
+index 175bf80..cf1b3c9 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/caps/host_pointer.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/caps/host_pointer.rs
+@@ -361,6 +361,34 @@ pub unsafe fn query(
+     }
+ }
+ 
++/// What `HOST_ALLOCATION_EXT` offers one image shape, asked only where the
++/// extension that spells the handle type is advertised.
++///
++/// [`query`] asks the buffer half of the same question behind the same gate.
++/// The image half is asked by the capability reports in
++/// [`super::linear_sampled`] and [`super::linear_target`], and it used to be
++/// asked unconditionally: naming `HOST_ALLOCATION_EXT` in a
++/// `VkPhysicalDeviceExternalImageFormatInfo` on a device that does not advertise
++/// `VK_EXT_external_memory_host` is invalid usage
++/// (`VUID-VkPhysicalDeviceExternalImageFormatInfo-handleType-parameter`), not a
++/// question whose answer is "no". Mesa's Dozen on Direct3D 12 is such a device,
++/// and the validation layer named the call for every probed format on every
++/// device create. Unasked reads as no import features, which is the truth on
++/// that host: it has no import path for the shape to use.
++///
++/// `ask` makes the `vkGetPhysicalDeviceImageFormatProperties2` call and returns
++/// `None` when the device cannot make the image at all — a "no" for that shape
++/// rather than an error for the boot.
++pub(crate) fn host_allocation_image_features(
++    has_extension: &dyn Fn(&std::ffi::CStr) -> bool,
++    ask: impl FnOnce() -> Option<vk::ExternalMemoryFeatureFlags>,
++) -> vk::ExternalMemoryFeatureFlags {
++    if !has_extension(vk::EXT_EXTERNAL_MEMORY_HOST_NAME) {
++        return vk::ExternalMemoryFeatureFlags::empty();
++    }
++    ask().unwrap_or_default()
++}
++
+ /// The largest single host-pointer import this device will ask any driver for,
+ /// before the device's own limits narrow it further.
+ ///
+@@ -548,6 +576,36 @@ mod tests {
+             .all(|s| s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
+     }
+ 
++    /// `HOST_ALLOCATION_EXT` is spelled by `VK_EXT_external_memory_host`, so a
++    /// device that does not advertise the extension is not asked about it for
++    /// an image either. Naming it there is invalid usage
++    /// (`VUID-VkPhysicalDeviceExternalImageFormatInfo-handleType-parameter`),
++    /// which Mesa's Dozen reported for every probed format on every device
++    /// create: a validation error, not an answer. The question is the closure,
++    /// and it must not run.
++    #[test]
++    fn the_image_import_question_needs_the_extension_that_spells_its_handle_type() {
++        let importable = vk::ExternalMemoryFeatureFlags::IMPORTABLE;
++        let asked = std::cell::Cell::new(0);
++        let ask = || {
++            asked.set(asked.get() + 1);
++            Some(importable)
++        };
++        let none = |_: &std::ffi::CStr| false;
++        let another = |name: &std::ffi::CStr| name == ash::khr::push_descriptor::NAME;
++        let without: [&dyn Fn(&std::ffi::CStr) -> bool; 2] = [&none, &another];
++        for has_extension in without {
++            assert!(host_allocation_image_features(has_extension, ask).is_empty());
++        }
++        assert_eq!(asked.get(), 0, "a device without the extension was asked");
++
++        let advertised = |name: &std::ffi::CStr| name == vk::EXT_EXTERNAL_MEMORY_HOST_NAME;
++        assert_eq!(host_allocation_image_features(&advertised, ask), importable);
++        assert_eq!(asked.get(), 1);
++        // A device that cannot make the image at all is a "no" for that shape.
++        assert!(host_allocation_image_features(&advertised, || None).is_empty());
++    }
++
+     /// A negative rung carries no granularity. A non-zero alignment beside a
+     /// refusal is a number an import site could act on, and every one of those
+     /// rungs describes a device that would reject the import.
+diff --git a/crates/reims-vgpu/src/backend/vulkan/caps/linear_sampled.rs b/crates/reims-vgpu/src/backend/vulkan/caps/linear_sampled.rs
+index c29e636..53c50d9 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/caps/linear_sampled.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/caps/linear_sampled.rs
+@@ -162,38 +162,48 @@ impl LinearFormatVerdict {
+ /// Emitted on the `OFF` channel at device create, beside `vk_caps`, because it
+ /// is a fact about the host and not a loss. One line per boot.
+ ///
++/// The import half is asked through
++/// [`super::host_pointer::host_allocation_image_features`], so a device that
++/// does not advertise `VK_EXT_external_memory_host` reads `not_importable`
++/// without being handed a handle type it does not have; the line says which.
++///
+ /// # Safety
+ ///
+ /// `pd` must be a physical device belonging to `instance`.
+-pub unsafe fn report(instance: &ash::Instance, pd: vk::PhysicalDevice) {
++pub unsafe fn report(
++    instance: &ash::Instance,
++    pd: vk::PhysicalDevice,
++    has_extension: &dyn Fn(&std::ffi::CStr) -> bool,
++) {
+     let mut fields = String::new();
+     let mut possible = 0usize;
+     for (name, format) in PROBED {
+         let props = unsafe { instance.get_physical_device_format_properties(pd, *format) };
+         let mut verdict = LinearFormatVerdict::from_tiling(props.linear_tiling_features);
+ 
+-        let mut ext_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+-            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+-        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+-            .format(*format)
+-            .ty(vk::ImageType::TYPE_2D)
+-            .tiling(vk::ImageTiling::LINEAR)
+-            .usage(vk::ImageUsageFlags::SAMPLED)
+-            .push_next(&mut ext_info);
+-        let mut ext_props = vk::ExternalImageFormatProperties::default();
+-        let mut out = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
+-        // A device that cannot make this image at all answers `Err`, which is a
+-        // "no" for this format rather than an error for the boot.
+-        if unsafe { instance.get_physical_device_image_format_properties2(pd, &info, &mut out) }
+-            .is_ok()
+-        {
+-            let features = ext_props
+-                .external_memory_properties
+-                .external_memory_features;
+-            verdict.importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+-            verdict.dedicated_only =
+-                features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
+-        }
++        let features = super::host_pointer::host_allocation_image_features(has_extension, || {
++            let mut ext_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
++                .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
++            let info = vk::PhysicalDeviceImageFormatInfo2::default()
++                .format(*format)
++                .ty(vk::ImageType::TYPE_2D)
++                .tiling(vk::ImageTiling::LINEAR)
++                .usage(vk::ImageUsageFlags::SAMPLED)
++                .push_next(&mut ext_info);
++            let mut ext_props = vk::ExternalImageFormatProperties::default();
++            let mut out = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
++            // A device that cannot make this image at all answers `Err`, which is
++            // a "no" for this format rather than an error for the boot.
++            unsafe { instance.get_physical_device_image_format_properties2(pd, &info, &mut out) }
++                .ok()
++                .map(|()| {
++                    ext_props
++                        .external_memory_properties
++                        .external_memory_features
++                })
++        });
++        verdict.importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
++        verdict.dedicated_only = features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
+ 
+         if verdict.device_conditions_hold() {
+             possible += 1;
+@@ -201,10 +211,11 @@ pub unsafe fn report(instance: &ash::Instance, pd: vk::PhysicalDevice) {
+         fields.push_str(&format!(" {name}={}", verdict.slug()));
+     }
+     crate::observe::off(format!(
+-        "vk_linear_sampled alias_possible={possible}/{}{fields} (device conditions only — a window \
+-         also needs vkGetImageSubresourceLayout's rowPitch to equal the guest's declared pitch, \
+-         which is per-window and not asked here)",
+-        PROBED.len()
++        "vk_linear_sampled alias_possible={possible}/{}{fields} host_pointer_extension={} (device \
++         conditions only — a window also needs vkGetImageSubresourceLayout's rowPitch to equal the \
++         guest's declared pitch, which is per-window and not asked here)",
++        PROBED.len(),
++        has_extension(vk::EXT_EXTERNAL_MEMORY_HOST_NAME),
+     ));
+ }
+ 
+diff --git a/crates/reims-vgpu/src/backend/vulkan/caps/linear_target.rs b/crates/reims-vgpu/src/backend/vulkan/caps/linear_target.rs
+index 3e53f94..2abd4da 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/caps/linear_target.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/caps/linear_target.rs
+@@ -80,36 +80,45 @@ impl LinearTargetVerdict {
+ 
+ /// Report whether each resident colour format can be a linear imported target.
+ ///
++/// The import half is asked through
++/// [`super::host_pointer::host_allocation_image_features`], so a device without
++/// `VK_EXT_external_memory_host` reads `not_importable` unasked.
++///
+ /// # Safety
+ ///
+ /// `pd` must be a physical device belonging to `instance`.
+-pub(crate) unsafe fn report(instance: &ash::Instance, pd: vk::PhysicalDevice) {
++pub(crate) unsafe fn report(
++    instance: &ash::Instance,
++    pd: vk::PhysicalDevice,
++    has_extension: &dyn Fn(&std::ffi::CStr) -> bool,
++) {
+     let mut fields = String::new();
+     let mut possible = 0usize;
+     for (name, format) in PROBED {
+         let props = unsafe { instance.get_physical_device_format_properties(pd, *format) };
+         let mut verdict = LinearTargetVerdict::from_tiling(props.linear_tiling_features);
+ 
+-        let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+-            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+-        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+-            .format(*format)
+-            .ty(vk::ImageType::TYPE_2D)
+-            .tiling(vk::ImageTiling::LINEAR)
+-            .usage(BASE_USAGE)
+-            .push_next(&mut external);
+-        let mut external_props = vk::ExternalImageFormatProperties::default();
+-        let mut out = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+-        if unsafe { instance.get_physical_device_image_format_properties2(pd, &info, &mut out) }
+-            .is_ok()
+-        {
+-            let features = external_props
+-                .external_memory_properties
+-                .external_memory_features;
+-            verdict.importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+-            verdict.dedicated_only =
+-                features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
+-        }
++        let features = super::host_pointer::host_allocation_image_features(has_extension, || {
++            let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
++                .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
++            let info = vk::PhysicalDeviceImageFormatInfo2::default()
++                .format(*format)
++                .ty(vk::ImageType::TYPE_2D)
++                .tiling(vk::ImageTiling::LINEAR)
++                .usage(BASE_USAGE)
++                .push_next(&mut external);
++            let mut external_props = vk::ExternalImageFormatProperties::default();
++            let mut out = vk::ImageFormatProperties2::default().push_next(&mut external_props);
++            unsafe { instance.get_physical_device_image_format_properties2(pd, &info, &mut out) }
++                .ok()
++                .map(|()| {
++                    external_props
++                        .external_memory_properties
++                        .external_memory_features
++                })
++        });
++        verdict.importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
++        verdict.dedicated_only = features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
+ 
+         if verdict.device_conditions_hold() {
+             possible += 1;
+@@ -117,8 +126,9 @@ pub(crate) unsafe fn report(instance: &ash::Instance, pd: vk::PhysicalDevice) {
+         fields.push_str(&format!(" {name}={}", verdict.slug()));
+     }
+     crate::observe::off(format!(
+-        "vk_linear_target alias_possible={possible}/{}{fields} (device conditions only; each target also needs a stable alias, compatible memory type, and matching row pitch)",
+-        PROBED.len()
++        "vk_linear_target alias_possible={possible}/{}{fields} host_pointer_extension={} (device conditions only; each target also needs a stable alias, compatible memory type, and matching row pitch)",
++        PROBED.len(),
++        has_extension(vk::EXT_EXTERNAL_MEMORY_HOST_NAME),
+     ));
+ }
+ 
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+index 0f63ce2..ab3576d 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+@@ -2385,13 +2385,17 @@ impl ObjectCaches {
+         // Framebuffer-fetch feedback loop: the same-pixel color-write →
+         // input-read ordering within the one subpass. BY_REGION keeps it
+         // framebuffer-local (the form MoltenVK lowers to tile-memory fetch).
++        // The per-primitive rung records a barrier inside the pass with exactly
++        // this scope, so both take it from the one owner.
++        let (fetch_src_stage, fetch_src_access) = super::color_input::INPUT_ORDER_SRC;
++        let (fetch_dst_stage, fetch_dst_access) = super::color_input::INPUT_ORDER_DST;
+         let fetch_dep = vk::SubpassDependency::default()
+             .src_subpass(0)
+             .dst_subpass(0)
+-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+-            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+-            .dst_access_mask(vk::AccessFlags::INPUT_ATTACHMENT_READ)
++            .src_stage_mask(fetch_src_stage)
++            .dst_stage_mask(fetch_dst_stage)
++            .src_access_mask(fetch_src_access)
++            .dst_access_mask(fetch_dst_access)
+             .dependency_flags(vk::DependencyFlags::BY_REGION);
+         let mut deps: Vec<vk::SubpassDependency> = external_dependencies(
+             key.depth.is_some(),
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/color_input.rs b/crates/reims-vgpu/src/backend/vulkan/engine/color_input.rs
+index 49a38a9..7f42b8c 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/color_input.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/color_input.rs
+@@ -1,4 +1,23 @@
+ //! Admitted ordered framebuffer inputs. No feature widening or attachment inference.
++//!
++//! # Two ways to order a read after the writes before it
++//!
++//! A Metal fragment that reads its own colour attachment (`[[color(n)]]`) sees
++//! every earlier fragment's write to that sample: earlier draws, and earlier
++//! primitives of the same draw. Vulkan gives that inside one draw only with
++//! `VK_EXT_rasterization_order_attachment_access`; across draws a `BY_REGION`
++//! self-dependency barrier gives it on every device.
++//!
++//! [`InputOrder::Rasterization`] is the extension. [`InputOrder::PerPrimitive`]
++//! is the same contract on a device without it (Mesa's Dozen on Direct3D 12 is
++//! one): every primitive is recorded as its own draw after that barrier. That
++//! is exact, not an approximation. One primitive covers a sample at most once,
++//! so no fragment of it reads another fragment of it, and the barrier orders it
++//! after every primitive before it, which is rasterization order spelled as
++//! barriers. [`PrimitiveSplit::plan`] refuses by name the draws whose split
++//! would be observable: a module reading a built-in the split changes, a strip
++//! whose odd triangles would flip facing where facing decides something, and
++//! wireframe triangles, whose edges can cover one sample twice.
+ use super::reason::DrawReason;
+ use super::types::DrawError;
+ use crate::backend::vulkan::caps::device_features::DeviceFeatures;
+@@ -6,30 +25,62 @@ use ash::vk;
+ pub use reims_vgpu_core::pass::{
+     ColorInputIndex, ColorInputIndexError, ColorInputs, COLOR_ATTACHMENTS,
+ };
++use reims_vgpu_core::topology::{PrimitiveType, TopologyClass};
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub enum ColorInputDecline {
+     InvalidIndex(ColorInputIndexError),
+-    OrderedAccessUnavailable,
+-    PhysicalCapacity { requested: usize, limit: u32 },
+-    StageSpan { requested: usize, limit: u32 },
+-    DescriptorCapacity { requested: u32, limit: u32 },
+-    MissingAttachment { index: usize },
++    PhysicalCapacity {
++        requested: usize,
++        limit: u32,
++    },
++    StageSpan {
++        requested: usize,
++        limit: u32,
++    },
++    DescriptorCapacity {
++        requested: u32,
++        limit: u32,
++    },
++    MissingAttachment {
++        index: usize,
++    },
++    /// The draw would be recorded one primitive at a time and a module reads a
++    /// built-in whose value that changes.
++    UnorderedBuiltinObservable {
++        builtin: SplitBuiltin,
++    },
++    /// A triangle strip's odd triangles would be drawn with reversed winding,
++    /// and this draw has something facing decides.
++    UnorderedStripFacing {
++        term: FacingTerm,
++    },
++    /// Triangles rasterized as edges: one triangle's edges meet at its
++    /// vertices, so one primitive can cover a sample twice.
++    UnorderedWireframe,
++    /// More primitive draws than one guest draw may expand into, or a range
++    /// that does not fit the draw's own index space.
++    UnorderedSplitLimit {
++        draws: u64,
++        limit: u64,
++    },
+ }
+ impl crate::observe::Decline for ColorInputDecline {
+     fn slug(&self) -> &'static str {
+         match self {
+             Self::InvalidIndex(_) => "color_input_index_out_of_range",
+-            Self::OrderedAccessUnavailable => "color_input_ordered_access_unavailable",
+             Self::PhysicalCapacity { .. } => "color_input_attachment_capacity",
+             Self::StageSpan { .. } => "color_input_stage_span",
+             Self::DescriptorCapacity { .. } => "color_input_descriptor_capacity",
+             Self::MissingAttachment { .. } => "color_input_attachment_missing",
++            Self::UnorderedBuiltinObservable { .. } => "color_input_unordered_builtin",
++            Self::UnorderedStripFacing { .. } => "color_input_unordered_strip_facing",
++            Self::UnorderedWireframe => "color_input_unordered_wireframe",
++            Self::UnorderedSplitLimit { .. } => "color_input_unordered_split_limit",
+         }
+     }
+     fn fields(&self) -> Vec<(&'static str, String)> {
+         match self {
+             Self::InvalidIndex(e) => vec![("index", e.0.to_string())],
+-            Self::OrderedAccessUnavailable => vec![],
+             Self::PhysicalCapacity { requested, limit } => vec![
+                 ("requested", requested.to_string()),
+                 ("limit", limit.to_string()),
+@@ -43,14 +94,46 @@ impl crate::observe::Decline for ColorInputDecline {
+                 ("limit", limit.to_string()),
+             ],
+             Self::MissingAttachment { index } => vec![("index", index.to_string())],
++            Self::UnorderedBuiltinObservable { builtin } => {
++                vec![("builtin", builtin.slug().to_owned())]
++            }
++            Self::UnorderedStripFacing { term } => vec![("term", term.slug().to_owned())],
++            Self::UnorderedWireframe => vec![],
++            Self::UnorderedSplitLimit { draws, limit } => {
++                vec![("draws", draws.to_string()), ("limit", limit.to_string())]
++            }
+         }
+     }
+ }
+ pub(crate) fn refusal(r: ColorInputDecline) -> DrawError {
+     DrawError::Unsupported(DrawReason::ColorInput(r))
+ }
++
++/// How a draw's reads of its own colour attachments are ordered after the
++/// writes before them. Chosen once per device from a capability, never by name.
+ #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+-pub(crate) struct OrderedColorInputs(ColorInputs);
++pub(crate) enum InputOrder {
++    /// `VK_EXT_rasterization_order_attachment_access`: the subpass and
++    /// pipeline flags order every earlier fragment's write before a later read.
++    #[default]
++    Rasterization,
++    /// No such guarantee on this device: each primitive is its own draw after
++    /// [`record_primitive_barrier`]. See the module doc for why that is exact.
++    PerPrimitive,
++}
++impl InputOrder {
++    /// The one place the rung is chosen.
++    pub(crate) fn of(caps: &DeviceFeatures) -> Self {
++        if caps.ordered_color_attachment_access {
++            Self::Rasterization
++        } else {
++            Self::PerPrimitive
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
++pub(crate) struct OrderedColorInputs(ColorInputs, InputOrder);
+ impl OrderedColorInputs {
+     pub(crate) fn admit(
+         inputs: ColorInputs,
+@@ -60,9 +143,6 @@ impl OrderedColorInputs {
+         if inputs.is_empty() {
+             return Ok(Self::default());
+         }
+-        if !caps.ordered_color_attachment_access {
+-            return Err(refusal(ColorInputDecline::OrderedAccessUnavailable));
+-        }
+         if materialized > COLOR_ATTACHMENTS || materialized > caps.max_color_attachments as usize {
+             return Err(refusal(ColorInputDecline::PhysicalCapacity {
+                 requested: materialized,
+@@ -88,7 +168,7 @@ impl OrderedColorInputs {
+                 }));
+             }
+         }
+-        Ok(Self(inputs))
++        Ok(Self(inputs, InputOrder::of(caps)))
+     }
+     pub(crate) fn is_empty(self) -> bool {
+         self.0.is_empty()
+@@ -102,18 +182,30 @@ impl OrderedColorInputs {
+     pub(crate) fn span(self) -> usize {
+         self.0.span()
+     }
++    #[cfg(test)]
++    pub(crate) fn order(self) -> InputOrder {
++        self.1
++    }
++    /// Whether this draw reads its attachments and must be recorded one
++    /// primitive at a time to do so in order.
++    pub(crate) fn per_primitive(self) -> bool {
++        !self.is_empty() && self.1 == InputOrder::PerPrimitive
++    }
++    fn rasterization_ordered(self) -> bool {
++        !self.is_empty() && self.1 == InputOrder::Rasterization
++    }
+     pub(crate) fn subpass_flags(self) -> vk::SubpassDescriptionFlags {
+-        if self.is_empty() {
+-            vk::SubpassDescriptionFlags::empty()
+-        } else {
++        if self.rasterization_ordered() {
+             vk::SubpassDescriptionFlags::RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_EXT
++        } else {
++            vk::SubpassDescriptionFlags::empty()
+         }
+     }
+     pub(crate) fn blend_flags(self) -> vk::PipelineColorBlendStateCreateFlags {
+-        if self.is_empty() {
+-            vk::PipelineColorBlendStateCreateFlags::empty()
+-        } else {
++        if self.rasterization_ordered() {
+             vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT
++        } else {
++            vk::PipelineColorBlendStateCreateFlags::empty()
+         }
+     }
+     #[cfg(test)]
+@@ -132,18 +224,251 @@ impl OrderedColorInputs {
+         .unwrap()
+     }
+ }
++
++/// The framebuffer-fetch self-dependency, in the one spelling the render pass
++/// and [`record_primitive_barrier`] both take it from: colour writes made
++/// visible to input-attachment reads of the same sample. A barrier inside a
++/// render pass may only name what one of its self-dependencies names, so the
++/// two disagreeing would be invalid usage, not a slower path.
++pub(crate) const INPUT_ORDER_SRC: (vk::PipelineStageFlags, vk::AccessFlags) = (
++    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
++    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
++);
++pub(crate) const INPUT_ORDER_DST: (vk::PipelineStageFlags, vk::AccessFlags) = (
++    vk::PipelineStageFlags::FRAGMENT_SHADER,
++    vk::AccessFlags::INPUT_ATTACHMENT_READ,
++);
++
++/// Make everything this subpass wrote visible to the next primitive's reads.
++///
++/// # Safety
++///
++/// `cb` is recording inside a render pass instance whose subpass carries the
++/// framebuffer-fetch self-dependency built from [`INPUT_ORDER_SRC`] and
++/// [`INPUT_ORDER_DST`], which every pass with colour inputs does.
++pub(crate) unsafe fn record_primitive_barrier(device: &ash::Device, cb: vk::CommandBuffer) {
++    let barrier = [vk::MemoryBarrier::default()
++        .src_access_mask(INPUT_ORDER_SRC.1)
++        .dst_access_mask(INPUT_ORDER_DST.1)];
++    unsafe {
++        device.cmd_pipeline_barrier(
++            cb,
++            INPUT_ORDER_SRC.0,
++            INPUT_ORDER_DST.0,
++            vk::DependencyFlags::BY_REGION,
++            &barrier,
++            &[],
++            &[],
++        )
++    };
++}
++
++/// A built-in whose value differs once a draw is recorded as its primitives.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum SplitBuiltin {
++    /// Restarts at zero in every primitive draw.
++    PrimitiveId,
++    /// Follows the first vertex of a non-indexed draw.
++    BaseVertex,
++    /// Follows the first instance.
++    BaseInstance,
++}
++impl SplitBuiltin {
++    fn slug(self) -> &'static str {
++        match self {
++            Self::PrimitiveId => "primitive_id",
++            Self::BaseVertex => "base_vertex",
++            Self::BaseInstance => "base_instance",
++        }
++    }
++}
++
++/// What a reversed-winding strip triangle would change.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum FacingTerm {
++    Cull,
++    TwoSidedStencil,
++    FrontFacingRead,
++}
++impl FacingTerm {
++    fn slug(self) -> &'static str {
++        match self {
++            Self::Cull => "cull",
++            Self::TwoSidedStencil => "two_sided_stencil",
++            Self::FrontFacingRead => "front_facing",
++        }
++    }
++}
++
++/// Which split-observable built-ins the draw's two modules declare. Declared
++/// counts as read: a refusal is cheaper than a proof of dead code.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub(crate) struct SplitReads {
++    pub(crate) primitive_id: bool,
++    pub(crate) base_vertex: bool,
++    pub(crate) base_instance: bool,
++    pub(crate) front_facing: bool,
++}
++impl SplitReads {
++    /// Read off the two translated modules.
++    pub(crate) fn of(vertex: &[u32], fragment: &[u32]) -> Self {
++        use crate::runtime::spirv_bind::{
++            declares_builtin, BUILTIN_BASE_INSTANCE, BUILTIN_BASE_VERTEX,
++        };
++        use crate::runtime::spirv_bind::{BUILTIN_FRONT_FACING, BUILTIN_PRIMITIVE_ID};
++        let either =
++            |builtin| declares_builtin(vertex, builtin) || declares_builtin(fragment, builtin);
++        Self {
++            primitive_id: either(BUILTIN_PRIMITIVE_ID),
++            base_vertex: either(BUILTIN_BASE_VERTEX),
++            base_instance: either(BUILTIN_BASE_INSTANCE),
++            front_facing: either(BUILTIN_FRONT_FACING),
++        }
++    }
++}
++
++/// The facts about one draw the per-primitive rung needs, read from the
++/// request and its two translated modules.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) struct DrawShape {
++    pub(crate) topology: PrimitiveType,
++    /// Indices for an indexed draw, vertices otherwise.
++    pub(crate) elements: u32,
++    /// First vertex of a non-indexed draw; zero for an indexed one, whose
++    /// first index is zero in this engine.
++    pub(crate) first: u32,
++    pub(crate) instances: u32,
++    pub(crate) base_instance: u32,
++    pub(crate) indexed: bool,
++    /// `MTLCullMode` other than none.
++    pub(crate) culls: bool,
++    /// `MTLTriangleFillMode` other than fill.
++    pub(crate) wireframe: bool,
++    /// The two stencil faces differ in ops or reference.
++    pub(crate) two_sided_stencil: bool,
++    pub(crate) reads: SplitReads,
++}
++
++/// One primitive's draw, in the original draw's own coordinates.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) struct PrimitiveDraw {
++    pub(crate) first_instance: u32,
++    /// First index of an indexed draw, first vertex otherwise.
++    pub(crate) first: u32,
++    pub(crate) count: u32,
++}
++
++/// Draws one guest draw may expand into on the per-primitive rung. Each is a
++/// barrier and a draw; the bound keeps a pathological guest draw from turning
++/// into an unbounded command buffer, and refusing past it names the count.
++pub(crate) const MAX_PRIMITIVE_DRAWS: u64 = 4096;
++
++/// A draw recorded as its primitives, in primitive order: every primitive of
++/// instance 0, then of instance 1, and so on.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) struct PrimitiveSplit {
++    span: u32,
++    stride: u32,
++    primitives: u32,
++    shape: DrawShape,
++}
++impl PrimitiveSplit {
++    pub(crate) fn plan(shape: DrawShape) -> Result<Self, DrawError> {
++        let (span, stride) = match shape.topology {
++            PrimitiveType::Point => (1, 1),
++            PrimitiveType::Line => (2, 2),
++            PrimitiveType::LineStrip => (2, 1),
++            PrimitiveType::Triangle => (3, 3),
++            PrimitiveType::TriangleStrip => (3, 1),
++        };
++        let primitives = if shape.elements < span {
++            0
++        } else {
++            (shape.elements - span) / stride + 1
++        };
++        let split = Self {
++            span,
++            stride,
++            primitives,
++            shape,
++        };
++        let draws = split.len();
++        if draws == 0 {
++            return Ok(split);
++        }
++        let builtin = |builtin| refusal(ColorInputDecline::UnorderedBuiltinObservable { builtin });
++        if shape.reads.primitive_id && draws > 1 {
++            return Err(builtin(SplitBuiltin::PrimitiveId));
++        }
++        if shape.reads.base_vertex && !shape.indexed && primitives > 1 {
++            return Err(builtin(SplitBuiltin::BaseVertex));
++        }
++        if shape.reads.base_instance && shape.instances > 1 {
++            return Err(builtin(SplitBuiltin::BaseInstance));
++        }
++        if shape.wireframe && shape.topology.class() == TopologyClass::Triangle {
++            return Err(refusal(ColorInputDecline::UnorderedWireframe));
++        }
++        if shape.topology == PrimitiveType::TriangleStrip && primitives > 1 {
++            let facing = |term| refusal(ColorInputDecline::UnorderedStripFacing { term });
++            if shape.culls {
++                return Err(facing(FacingTerm::Cull));
++            }
++            if shape.two_sided_stencil {
++                return Err(facing(FacingTerm::TwoSidedStencil));
++            }
++            if shape.reads.front_facing {
++                return Err(facing(FacingTerm::FrontFacingRead));
++            }
++        }
++        let fits = shape.first.checked_add(shape.elements).is_some()
++            && shape.base_instance.checked_add(shape.instances).is_some();
++        if draws > MAX_PRIMITIVE_DRAWS || !fits {
++            return Err(refusal(ColorInputDecline::UnorderedSplitLimit {
++                draws,
++                limit: MAX_PRIMITIVE_DRAWS,
++            }));
++        }
++        Ok(split)
++    }
++    pub(crate) fn len(self) -> u64 {
++        u64::from(self.primitives) * u64::from(self.shape.instances)
++    }
++    pub(crate) fn draws(self) -> impl Iterator<Item = PrimitiveDraw> {
++        let Self {
++            span,
++            stride,
++            primitives,
++            shape,
++        } = self;
++        (0..shape.instances).flat_map(move |instance| {
++            (0..primitives).map(move |primitive| PrimitiveDraw {
++                first_instance: shape.base_instance + instance,
++                first: shape.first + primitive * stride,
++                count: span,
++            })
++        })
++    }
++}
++
+ #[cfg(test)]
+ mod mrt_order_plan_tests {
+     use super::*;
+     #[test]
+     fn mrt_order_gates_every_nonempty_input_and_preserves_empty_hosts() {
+-        let off = DeviceFeatures::default();
++        let off = DeviceFeatures {
++            max_color_attachments: 8,
++            input_attachment_stage_limit: 8,
++            input_attachment_descriptor_limit: 8,
++            ..Default::default()
++        };
+         assert!(OrderedColorInputs::admit(ColorInputs::default(), &off, 100).is_ok());
++        // A host without the extension admits the same inputs on the other rung.
+         for i in [0, 1, 7] {
+-            assert_eq!(
+-                OrderedColorInputs::admit(ColorInputs::parse([i]).unwrap(), &off, 8),
+-                Err(refusal(ColorInputDecline::OrderedAccessUnavailable))
+-            );
++            let admitted =
++                OrderedColorInputs::admit(ColorInputs::parse([i]).unwrap(), &off, 8).unwrap();
++            assert_eq!(admitted.order(), InputOrder::PerPrimitive);
++            assert!(admitted.per_primitive());
+         }
+         let on = DeviceFeatures {
+             ordered_color_attachment_access: true,
+@@ -152,7 +477,9 @@ mod mrt_order_plan_tests {
+             input_attachment_descriptor_limit: 1,
+             ..Default::default()
+         };
+-        assert!(OrderedColorInputs::admit(ColorInputs::parse([7]).unwrap(), &on, 8).is_ok());
++        let ordered = OrderedColorInputs::admit(ColorInputs::parse([7]).unwrap(), &on, 8).unwrap();
++        assert_eq!(ordered.order(), InputOrder::Rasterization);
++        assert!(!ordered.per_primitive());
+         assert!(matches!(
+             OrderedColorInputs::admit(ColorInputs::parse([1]).unwrap(), &on, 1),
+             Err(DrawError::Unsupported(DrawReason::ColorInput(
+@@ -176,6 +503,271 @@ mod mrt_order_plan_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod per_primitive_tests {
++    use super::*;
++
++    fn caps(ordered: bool) -> DeviceFeatures {
++        DeviceFeatures {
++            ordered_color_attachment_access: ordered,
++            max_color_attachments: 8,
++            input_attachment_stage_limit: 8,
++            input_attachment_descriptor_limit: 8,
++            ..Default::default()
++        }
++    }
++
++    fn shape(topology: PrimitiveType, elements: u32) -> DrawShape {
++        DrawShape {
++            topology,
++            elements,
++            first: 0,
++            instances: 1,
++            base_instance: 0,
++            indexed: true,
++            culls: false,
++            wireframe: false,
++            two_sided_stencil: false,
++            reads: SplitReads::default(),
++        }
++    }
++
++    fn decline(result: Result<PrimitiveSplit, DrawError>) -> ColorInputDecline {
++        match result {
++            Err(DrawError::Unsupported(DrawReason::ColorInput(decline))) => decline,
++            other => panic!("expected a colour-input refusal, got {other:?}"),
++        }
++    }
++
++    /// The extension's flags exist only where the extension does. A
++    /// per-primitive pass naming them would be invalid usage on exactly the
++    /// hosts that rung is for.
++    #[test]
++    fn the_rasterization_order_flags_belong_to_the_extension_rung_only() {
++        let inputs = ColorInputs::parse([0, 1]).unwrap();
++        let ordered = OrderedColorInputs::admit(inputs, &caps(true), 2).unwrap();
++        let split = OrderedColorInputs::admit(inputs, &caps(false), 2).unwrap();
++        assert!(!ordered.subpass_flags().is_empty() && !ordered.blend_flags().is_empty());
++        assert!(split.subpass_flags().is_empty() && split.blend_flags().is_empty());
++        // The two rungs are different passes and pipelines, never one cache entry.
++        assert_ne!(ordered, split);
++        assert!(!OrderedColorInputs::default().per_primitive());
++    }
++
++    /// One draw per primitive, in primitive order, each starting where the
++    /// original draw's primitive started. Counts per topology follow Vulkan's
++    /// primitive definitions; trailing elements that complete no primitive draw
++    /// nothing either way.
++    #[test]
++    fn every_topology_splits_into_its_own_primitives_in_order() {
++        let windows = |s: DrawShape| -> Vec<(u32, u32)> {
++            PrimitiveSplit::plan(s)
++                .unwrap()
++                .draws()
++                .map(|d| (d.first, d.count))
++                .collect()
++        };
++        assert_eq!(windows(shape(PrimitiveType::Triangle, 6)), [(0, 3), (3, 3)]);
++        assert_eq!(windows(shape(PrimitiveType::Triangle, 8)), [(0, 3), (3, 3)]);
++        assert_eq!(
++            windows(shape(PrimitiveType::TriangleStrip, 5)),
++            [(0, 3), (1, 3), (2, 3)]
++        );
++        assert_eq!(windows(shape(PrimitiveType::Line, 5)), [(0, 2), (2, 2)]);
++        assert_eq!(
++            windows(shape(PrimitiveType::LineStrip, 3)),
++            [(0, 2), (1, 2)]
++        );
++        assert_eq!(
++            windows(shape(PrimitiveType::Point, 3)),
++            [(0, 1), (1, 1), (2, 1)]
++        );
++        assert!(windows(shape(PrimitiveType::Triangle, 2)).is_empty());
++        assert!(windows(shape(PrimitiveType::TriangleStrip, 0)).is_empty());
++    }
++
++    /// Instances keep their order and their own instance index; a non-indexed
++    /// draw keeps its own first vertex, so `VertexIndex` is unchanged.
++    #[test]
++    fn instances_and_first_vertex_are_carried_into_every_primitive_draw() {
++        let s = DrawShape {
++            first: 10,
++            instances: 2,
++            base_instance: 5,
++            indexed: false,
++            ..shape(PrimitiveType::Triangle, 6)
++        };
++        let draws: Vec<_> = PrimitiveSplit::plan(s).unwrap().draws().collect();
++        let expect = |first_instance, first| PrimitiveDraw {
++            first_instance,
++            first,
++            count: 3,
++        };
++        assert_eq!(
++            draws,
++            [expect(5, 10), expect(5, 13), expect(6, 10), expect(6, 13)]
++        );
++        assert_eq!(PrimitiveSplit::plan(s).unwrap().len(), 4);
++    }
++
++    /// The guest draws this rung was built for: a quad as an indexed
++    /// six-element triangle list and as a four-element strip, cull none, fill.
++    #[test]
++    fn the_guest_quad_shapes_are_admitted() {
++        let draws = |topology, elements| PrimitiveSplit::plan(shape(topology, elements));
++        assert_eq!(draws(PrimitiveType::Triangle, 6).unwrap().len(), 2);
++        assert_eq!(draws(PrimitiveType::Triangle, 168).unwrap().len(), 56);
++        assert_eq!(draws(PrimitiveType::TriangleStrip, 4).unwrap().len(), 2);
++    }
++
++    /// A built-in the split changes is a refusal, named, and only where the
++    /// split changes it: a single primitive draw is the original draw.
++    #[test]
++    fn a_split_observable_builtin_refuses_by_name() {
++        let reads = |reads: SplitReads| DrawShape {
++            reads,
++            ..shape(PrimitiveType::Triangle, 6)
++        };
++        assert_eq!(
++            decline(PrimitiveSplit::plan(reads(SplitReads {
++                primitive_id: true,
++                ..Default::default()
++            }))),
++            ColorInputDecline::UnorderedBuiltinObservable {
++                builtin: SplitBuiltin::PrimitiveId
++            }
++        );
++        let one = DrawShape {
++            reads: SplitReads {
++                primitive_id: true,
++                ..Default::default()
++            },
++            ..shape(PrimitiveType::Triangle, 3)
++        };
++        assert!(PrimitiveSplit::plan(one).is_ok());
++        // BaseVertex moves only with a non-indexed split.
++        let base_vertex = SplitReads {
++            base_vertex: true,
++            ..Default::default()
++        };
++        assert!(PrimitiveSplit::plan(reads(base_vertex)).is_ok());
++        assert_eq!(
++            decline(PrimitiveSplit::plan(DrawShape {
++                indexed: false,
++                ..reads(base_vertex)
++            })),
++            ColorInputDecline::UnorderedBuiltinObservable {
++                builtin: SplitBuiltin::BaseVertex
++            }
++        );
++        // BaseInstance moves only when there is more than one instance.
++        let base_instance = SplitReads {
++            base_instance: true,
++            ..Default::default()
++        };
++        assert!(PrimitiveSplit::plan(reads(base_instance)).is_ok());
++        assert_eq!(
++            decline(PrimitiveSplit::plan(DrawShape {
++                instances: 2,
++                ..reads(base_instance)
++            })),
++            ColorInputDecline::UnorderedBuiltinObservable {
++                builtin: SplitBuiltin::BaseInstance
++            }
++        );
++    }
++
++    /// An odd strip triangle drawn alone has the opposite winding. That is
++    /// invisible unless something reads facing, so the refusal names which.
++    #[test]
++    fn a_strip_refuses_only_where_its_reversed_triangles_could_be_seen() {
++        let strip = shape(PrimitiveType::TriangleStrip, 4);
++        let term = |s: DrawShape| match decline(PrimitiveSplit::plan(s)) {
++            ColorInputDecline::UnorderedStripFacing { term } => term,
++            other => panic!("{other:?}"),
++        };
++        assert_eq!(
++            term(DrawShape {
++                culls: true,
++                ..strip
++            }),
++            FacingTerm::Cull
++        );
++        assert_eq!(
++            term(DrawShape {
++                two_sided_stencil: true,
++                ..strip
++            }),
++            FacingTerm::TwoSidedStencil
++        );
++        assert_eq!(
++            term(DrawShape {
++                reads: SplitReads {
++                    front_facing: true,
++                    ..Default::default()
++                },
++                ..strip
++            }),
++            FacingTerm::FrontFacingRead
++        );
++        // A one-triangle strip has no odd triangle, and a list never reverses.
++        let culled = |s: DrawShape| DrawShape { culls: true, ..s };
++        assert!(PrimitiveSplit::plan(culled(shape(PrimitiveType::TriangleStrip, 3))).is_ok());
++        assert!(PrimitiveSplit::plan(culled(shape(PrimitiveType::Triangle, 6))).is_ok());
++    }
++
++    /// Wireframe triangles cover their vertices with two edges each, so one
++    /// primitive is not single-coverage and no split makes it ordered.
++    #[test]
++    fn wireframe_triangles_refuse_and_lines_do_not() {
++        let wire = |topology, elements| DrawShape {
++            wireframe: true,
++            ..shape(topology, elements)
++        };
++        assert_eq!(
++            decline(PrimitiveSplit::plan(wire(PrimitiveType::Triangle, 3))),
++            ColorInputDecline::UnorderedWireframe
++        );
++        assert!(PrimitiveSplit::plan(wire(PrimitiveType::Line, 4)).is_ok());
++    }
++
++    /// The expansion is bounded, and the refusal carries the count.
++    #[test]
++    fn the_expansion_is_bounded_and_names_its_size() {
++        let cap = MAX_PRIMITIVE_DRAWS as u32;
++        let at = shape(PrimitiveType::Triangle, 3 * cap);
++        assert!(PrimitiveSplit::plan(at).is_ok());
++        let over = shape(PrimitiveType::Triangle, 3 * (cap + 1));
++        assert_eq!(
++            decline(PrimitiveSplit::plan(over)),
++            ColorInputDecline::UnorderedSplitLimit {
++                draws: MAX_PRIMITIVE_DRAWS + 1,
++                limit: MAX_PRIMITIVE_DRAWS
++            }
++        );
++    }
++
++    /// The barrier is the pass's own self-dependency: same stages, same
++    /// accesses, so recording it inside the pass is valid by construction.
++    #[test]
++    fn the_barrier_scope_is_the_fetch_dependency_scope() {
++        assert_eq!(
++            INPUT_ORDER_SRC,
++            (
++                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
++                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
++            )
++        );
++        assert_eq!(
++            INPUT_ORDER_DST,
++            (
++                vk::PipelineStageFlags::FRAGMENT_SHADER,
++                vk::AccessFlags::INPUT_ATTACHMENT_READ
++            )
++        );
++    }
++}
++
+ #[cfg(test)]
+ mod parent_review_span_tests {
+     use super::*;
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/context.rs b/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
+index 421bfd9..1ee7c8c 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
+@@ -1396,12 +1396,12 @@ impl DeviceContext {
+         // decides if the sampled cache is memoizing a copy that has to exist.
+         // Reported and never branched on — see the module doc for why a positive
+         // answer here is necessary and not sufficient.
+-        crate::backend::vulkan::caps::linear_sampled::report(&instance, pd);
++        crate::backend::vulkan::caps::linear_sampled::report(&instance, pd, &has_device_extension);
+         // Whether a resident colour image can use imported guest storage as
+         // its backing. Like the sampled report, this is necessary but not
+         // sufficient: alias stability, memory requirements and row pitch are
+         // per-target questions.
+-        crate::backend::vulkan::caps::linear_target::report(&instance, pd);
++        crate::backend::vulkan::caps::linear_target::report(&instance, pd, &has_device_extension);
+         // Fine-grained capabilities that do change what a draw can express.
+         crate::observe::off(format!(
+             "vk_device_select name={device_name:?} type={:?} depth_stencil_format={:?} bgra_storage_composite={} compute_capable={} quirks_no_deferred_batching={} quirks_guest_pages_authoritative={}",
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/counters.rs b/crates/reims-vgpu/src/backend/vulkan/engine/counters.rs
+index 7448724..781b1a2 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/counters.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/counters.rs
+@@ -247,6 +247,11 @@ engine_counters! {
+         pipeline_misses,
+         sampler_hits,
+         sampler_misses,
++        /// Draws the per-primitive colour-input rung recorded: one per primitive
++        /// of a guest draw that reads its own colour attachments on a device
++        /// without `VK_EXT_rasterization_order_attachment_access`. Zero where
++        /// the extension orders those reads instead.
++        color_input_primitive_draws,
+ 
+         // --- compute ---
+         compute_pipeline_hits,
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+index fdef881..77e50bd 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -2713,6 +2713,35 @@ fn depth_stencil_state(
+     .expect("every ordinal in a draw request was parsed from an enum on the way in")
+ }
+ 
++/// What [`super::color_input::PrimitiveSplit::plan`] decides from, read off the
++/// request: topology and counts in the coordinates the recorded draw uses (an
++/// indexed draw starts at index zero here), the raster and stencil state a
++/// reversed winding could act on, and the built-ins its two modules declare.
++fn primitive_shape(req: &DrawRequest) -> super::color_input::DrawShape {
++    use reims_vgpu_vulkan::raster::{MTL_CULL_MODE_NONE, MTL_TRIANGLE_FILL_MODE_FILL};
++    let stencil = req.depth.as_ref().and_then(|d| d.stencil);
++    super::color_input::DrawShape {
++        topology: req.primitive_topology.0,
++        elements: req
++            .indexed
++            .as_ref()
++            .map_or(req.vertex_count, |indexed| indexed.index_count),
++        first: if req.indexed.is_some() {
++            0
++        } else {
++            req.first_vertex
++        },
++        instances: req.instance_count.unwrap_or(1),
++        base_instance: req.base_instance,
++        indexed: req.indexed.is_some(),
++        culls: req.raster.cull_mode != MTL_CULL_MODE_NONE,
++        wireframe: req.raster.fill_mode != MTL_TRIANGLE_FILL_MODE_FILL,
++        two_sided_stencil: stencil
++            .is_some_and(|s| s.front != s.back || s.reference_front != s.reference_back),
++        reads: super::color_input::SplitReads::of(&req.vert_spirv, &req.frag_spirv),
++    }
++}
++
+ pub(crate) unsafe fn execute_draw_inner(
+     owner: &mut ContextOwner,
+     caches: &mut ObjectCaches,
+@@ -2739,6 +2768,17 @@ pub(crate) unsafe fn execute_draw_inner(
+             })
+         })?,
+     )?;
++    // Without rasterization-order attachment access a draw that reads its own
++    // attachments is recorded one primitive at a time. Whether that is exact
++    // for this draw is decided here, before anything is recorded, so a refusal
++    // costs no work.
++    let primitive_split = if color_inputs.per_primitive() {
++        Some(super::color_input::PrimitiveSplit::plan(primitive_shape(
++            req,
++        ))?)
++    } else {
++        None
++    };
+     pools.ensure_init(ctx, counters)?;
+ 
+     // Draw batching (deferred submit): a draw that hands the CPU nothing
+@@ -5429,18 +5469,45 @@ pub(crate) unsafe fn execute_draw_inner(
+     }
+     phase.enter(super::draw_phase::Phase::RecordDraw);
+     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters) };
+-    match (&req.indexed, &index_slot) {
+-        (Some(indexed), Some(ibuf)) => {
++    match (&req.indexed, &index_slot, primitive_split) {
++        (Some(indexed), Some(ibuf), split) => {
+             ctx.device
+                 .cmd_bind_index_buffer(cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk());
+-            ctx.device.cmd_draw_indexed(
+-                cb,
+-                indexed.index_count,
+-                req.instance_count.unwrap_or(1),
+-                0,
+-                indexed.vertex_offset,
+-                req.base_instance,
+-            );
++            if let Some(split) = split {
++                for draw in split.draws() {
++                    unsafe { super::color_input::record_primitive_barrier(&ctx.device, cb) };
++                    ctx.device.cmd_draw_indexed(
++                        cb,
++                        draw.count,
++                        1,
++                        draw.first,
++                        indexed.vertex_offset,
++                        draw.first_instance,
++                    );
++                }
++                counters
++                    .color_input_primitive_draws
++                    .fetch_add(split.len(), Ordering::Relaxed);
++            } else {
++                ctx.device.cmd_draw_indexed(
++                    cb,
++                    indexed.index_count,
++                    req.instance_count.unwrap_or(1),
++                    0,
++                    indexed.vertex_offset,
++                    req.base_instance,
++                );
++            }
++        }
++        (None, _, Some(split)) => {
++            for draw in split.draws() {
++                unsafe { super::color_input::record_primitive_barrier(&ctx.device, cb) };
++                ctx.device
++                    .cmd_draw(cb, draw.count, 1, draw.first, draw.first_instance);
++            }
++            counters
++                .color_input_primitive_draws
++                .fetch_add(split.len(), Ordering::Relaxed);
+         }
+         _ => {
+             ctx.device.cmd_draw(
+diff --git a/crates/reims-vgpu/src/runtime/spirv_bind.rs b/crates/reims-vgpu/src/runtime/spirv_bind.rs
+index af3f1c3..d574e7f 100644
+--- a/crates/reims-vgpu/src/runtime/spirv_bind.rs
++++ b/crates/reims-vgpu/src/runtime/spirv_bind.rs
+@@ -532,6 +532,45 @@ pub fn declares_descriptor(words: &[u32], binding: u32) -> bool {
+     descriptor_root(words, &instrs, binding, STORAGE_CLASS_UNIFORM_CONSTANT).is_some()
+ }
+ 
++/// `Decoration BuiltIn`.
++const DECORATION_BUILT_IN: u32 = 11;
++/// The built-ins whose values change, or whose facing a reversed winding
++/// changes, when a draw is recorded one primitive at a time; see
++/// `backend::vulkan::engine::color_input`.
++pub const BUILTIN_PRIMITIVE_ID: u32 = 7;
++pub const BUILTIN_FRONT_FACING: u32 = 17;
++pub const BUILTIN_BASE_VERTEX: u32 = 4424;
++pub const BUILTIN_BASE_INSTANCE: u32 = 4425;
++
++/// Whether the module declares a variable, or a block member, decorated
++/// `BuiltIn builtin`.
++///
++/// Declaration rather than use, on purpose: the caller refuses a draw whose
++/// split would change what a module could read, and a declared built-in is one
++/// it could. A stream that does not decode answers `true` for the same reason —
++/// nothing may be promised about a module this cannot read.
++pub fn declares_builtin(words: &[u32], builtin: u32) -> bool {
++    let Some(instrs) = instructions(words) else {
++        return true;
++    };
++    for &Instruction {
++        opcode,
++        word_count,
++        at: i,
++    } in &instrs
++    {
++        let decoration = match opcode {
++            OP_DECORATE if word_count >= 4 => &words[i + 2..i + 4],
++            OP_MEMBER_DECORATE if word_count >= 5 => &words[i + 3..i + 5],
++            _ => continue,
++        };
++        if decoration == [DECORATION_BUILT_IN, builtin] {
++            return true;
++        }
++    }
++    false
++}
++
+ /// Whether a declared descriptor is *statically used*, which is the bar Vulkan
+ /// actually sets.
+ ///
+@@ -5607,3 +5646,39 @@ mod more_tests {
+         assert_eq!(sampler_bindings(&words), vec![66]);
+     }
+ }
++
++#[cfg(test)]
++mod builtin_tests {
++    use super::*;
++
++    fn module(body: &[u32]) -> Vec<u32> {
++        let mut words = vec![0x0723_0203, 0x0001_0300, 0, 100, 0];
++        words.extend_from_slice(body);
++        words
++    }
++
++    /// Found on a variable and on a block member, and only for the built-in
++    /// asked about: `FrontFacing` on a member is not `PrimitiveId`.
++    #[test]
++    fn a_builtin_is_found_on_a_variable_and_on_a_block_member() {
++        let decorated = module(&[(4 << 16) | 71, 1, 11, BUILTIN_PRIMITIVE_ID]);
++        assert!(declares_builtin(&decorated, BUILTIN_PRIMITIVE_ID));
++        assert!(!declares_builtin(&decorated, BUILTIN_FRONT_FACING));
++        let member = module(&[(5 << 16) | 72, 2, 0, 11, BUILTIN_FRONT_FACING]);
++        assert!(declares_builtin(&member, BUILTIN_FRONT_FACING));
++        assert!(!declares_builtin(&member, BUILTIN_PRIMITIVE_ID));
++        // A binding decoration whose literal happens to equal a built-in's
++        // number is not that built-in.
++        let binding = module(&[(4 << 16) | 71, 1, DECORATION_BINDING, BUILTIN_PRIMITIVE_ID]);
++        assert!(!declares_builtin(&binding, BUILTIN_PRIMITIVE_ID));
++    }
++
++    /// A stream this cannot decode promises nothing.
++    #[test]
++    fn an_undecodable_module_answers_declared() {
++        assert!(declares_builtin(&[0], BUILTIN_BASE_VERTEX));
++        let truncated = module(&[(9 << 16) | 71, 1]);
++        assert!(declares_builtin(&truncated, BUILTIN_BASE_INSTANCE));
++        assert!(!declares_builtin(&module(&[]), BUILTIN_BASE_INSTANCE));
++    }
++}
+diff --git a/crates/reims-vgpu/tests/mrt_order_gpu.rs b/crates/reims-vgpu/tests/mrt_order_gpu.rs
+index c5be551..a7d0c9b 100644
+--- a/crates/reims-vgpu/tests/mrt_order_gpu.rs
++++ b/crates/reims-vgpu/tests/mrt_order_gpu.rs
+@@ -103,11 +103,24 @@ fn mrt_order_run(selected: &[u32], slot: usize, primitives: u32, label: &str, id
+             color_write_mask: Default::default(),
+         });
+     }
++    let before_draw = engine::counter_snapshot();
+     let output = engine::execute_draw_request(engine_device(), &req)
+         .expect("required indexed ordered engine draw");
+-    assert!(
+-        engine::test_ordered_color_attachment_access_active(),
+-        "actual created device enabled EXT color ordering"
++    // The ordering rung is the device's answer, not this test's: the EXT where
++    // the device advertises it, one draw per primitive where it does not. The
++    // oracle below is the same for both, which is the point.
++    let ordered = engine::test_ordered_color_attachment_access_active();
++    let rung = if ordered {
++        "rasterization_order"
++    } else {
++        "per_primitive"
++    };
++    assert_eq!(
++        engine::counter_snapshot()
++            .delta_since(&before_draw)
++            .color_input_primitive_draws,
++        if ordered { 0 } else { u64::from(primitives) },
++        "{rung}: the draw took the rung its device decides"
+     );
+     let mut expected0 = seed0;
+     let mut expected1 = seed1;
+@@ -193,7 +206,7 @@ fn mrt_order_run(selected: &[u32], slot: usize, primitives: u32, label: &str, id
+         seed0,
+     );
+     assert!(engine::resident_content_ready(&secondary));
+-    eprintln!("MRT_ORDER_EXECUTED label={label} inputs={selected:?} primitives_single_draw={primitives} secondary_slot={slot} ready_load_executed=true");
++    eprintln!("MRT_ORDER_EXECUTED label={label} order={rung} inputs={selected:?} primitives_single_draw={primitives} secondary_slot={slot} ready_load_executed=true");
+ }
+ #[test]
+ fn mrt_order_gpu_attachment1() {

@@ -1,0 +1,119 @@
+--- before/crates/reims-vgpu/src/backend/vulkan/engine/linear_target_import.rs
++++ fixed/crates/reims-vgpu/src/backend/vulkan/engine/linear_target_import.rs
+@@ -48,6 +48,8 @@
+     DisabledByEnv,
+     UnsupportedTopology,
+     HostImportUnavailable,
++    /// The external-image rail cannot yet establish preserved host pixels.
++    PreservedContentsUnsupported,
+     ParentAllocationMismatch,
+     ParentImport(super::host_ram::HostRamDecline),
+     HostPointerMisaligned,
+@@ -68,6 +70,7 @@
+             Self::DisabledByEnv => "disabled_by_env",
+             Self::UnsupportedTopology => "discrete_topology",
+             Self::HostImportUnavailable => "no_host_import",
++            Self::PreservedContentsUnsupported => "preserved_contents_unimplemented",
+             Self::ParentAllocationMismatch => "parent_allocation_mismatch",
+             Self::ParentImport(inner) => Decline::slug(&inner),
+             Self::HostPointerMisaligned => "host_pointer_misaligned",
+@@ -314,6 +317,19 @@
+     ))
+ }
+ 
++// VkImageCreateInfo-pNext-01443 requires an external image to start UNDEFINED.
++// Transitioning from UNDEFINED does not preserve existing guest pixels. Until
++// this rail establishes those pixels through a defined initialization operation,
++// a caller requiring them must use the existing owned-image upload path. This is
++// an initialization-contract refusal, not a statement about hardware support.
++fn imported_initial_layout(preserve_host_contents: bool) -> Result<vk::ImageLayout, WindowRefusal> {
++    if preserve_host_contents {
++        Err(WindowRefusal::PreservedContentsUnsupported)
++    } else {
++        Ok(vk::ImageLayout::UNDEFINED)
++    }
++}
++
+ pub(super) struct ImportedTarget {
+     pub image: vk::Image,
+ }
+@@ -371,6 +387,10 @@
+     if !parent_allocation_matches(import, backing) {
+         return Err(WindowRefusal::ParentAllocationMismatch);
+     }
++    // Both current consumers require the guest's existing pixels. Refuse before
++    // allocating an imported parent or creating a child; buffer imports remain
++    // available to the callers' ordinary pixel-preserving upload paths.
++    let initial_layout = imported_initial_layout(true)?;
+     let allocation =
+         unsafe { imports.allocation(ctx, import) }.map_err(WindowRefusal::ParentImport)?;
+     let alignment = ctx.caps.host_pointer.min_alignment;
+@@ -396,6 +416,7 @@
+                 format,
+                 usage,
+                 LayoutMode::ExplicitLinear,
++                initial_layout,
+             )
+         };
+         if explicit.is_ok() {
+@@ -415,6 +436,7 @@
+                 format,
+                 usage,
+                 LayoutMode::DriverLinear,
++                initial_layout,
+             )
+         };
+         let result = ordinary.or(explicit);
+@@ -433,6 +455,7 @@
+             format,
+             usage,
+             LayoutMode::DriverLinear,
++            initial_layout,
+         )
+     };
+     if result.is_ok() {
+@@ -451,6 +474,7 @@
+     format: vk::Format,
+     usage: vk::ImageUsageFlags,
+     mode: LayoutMode,
++    initial_layout: vk::ImageLayout,
+ ) -> Result<ImportedTarget, WindowRefusal> {
+     let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+     let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle);
+@@ -467,7 +491,7 @@
+         .array_layers(1)
+         .samples(vk::SampleCountFlags::TYPE_1)
+         .usage(usage)
+-        .initial_layout(vk::ImageLayout::PREINITIALIZED);
++        .initial_layout(initial_layout);
+     let image = match mode {
+         LayoutMode::DriverLinear => {
+             let create = base
+@@ -690,6 +714,19 @@
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn preserved_external_pixels_require_a_defined_initialization_contract() {
++        assert_eq!(
++            imported_initial_layout(true),
++            Err(WindowRefusal::PreservedContentsUnsupported)
++        );
++    }
++
++    #[test]
++    fn discardable_external_pixels_start_undefined() {
++        assert_eq!(imported_initial_layout(false), Ok(vk::ImageLayout::UNDEFINED));
++    }
++
+     fn layout(offset: u64, row_pitch: u64) -> vk::SubresourceLayout {
+         vk::SubresourceLayout {
+             offset,
+@@ -902,6 +939,7 @@
+             WindowRefusal::DisabledByEnv,
+             WindowRefusal::UnsupportedTopology,
+             WindowRefusal::HostImportUnavailable,
++            WindowRefusal::PreservedContentsUnsupported,
+             WindowRefusal::ParentAllocationMismatch,
+             WindowRefusal::HostPointerMisaligned,
+             WindowRefusal::SubresourceAfterPlane,

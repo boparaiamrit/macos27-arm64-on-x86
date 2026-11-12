@@ -1,0 +1,398 @@
+diff --git a/crates/reims-vgpu-protocol/src/iosurface_pages.rs b/crates/reims-vgpu-protocol/src/iosurface_pages.rs
+index 4023b95..ad5fcf8 100644
+--- a/crates/reims-vgpu-protocol/src/iosurface_pages.rs
++++ b/crates/reims-vgpu-protocol/src/iosurface_pages.rs
+@@ -53,6 +53,46 @@ pub const MAPPER_CAPTURE_REG_MAPPER_DEVICE: u32 = 19;
+ pub const MAPPER_CAPTURE_REG_REQUEST_TYPE: u32 = 21;
+ pub const MAPPER_CAPTURE_REG_MAPPING_INTERNAL: u32 = 22;
+ 
++/// Where one guest build leaves the directed handoff at the producer store.
++///
++/// The three values are what `do_host_mapping_gated` keeps in callee-saved
++/// registers across its iosfc producer write, so the indices are an artifact
++/// of that kext build's register allocation, not of the wire protocol.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct MapperCaptureRegs {
++    pub mapper_device: u32,
++    pub request_type: u32,
++    pub mapping_internal: u32,
++}
++
++/// The baseline handoff the constants above describe.
++pub const MAPPER_CAPTURE_REGS_BASELINE: MapperCaptureRegs = MapperCaptureRegs {
++    mapper_device: MAPPER_CAPTURE_REG_MAPPER_DEVICE,
++    request_type: MAPPER_CAPTURE_REG_REQUEST_TYPE,
++    mapping_internal: MAPPER_CAPTURE_REG_MAPPING_INTERNAL,
++};
++
++/// macOS 27 (26A428) `IOSurfaceParavirtMapperDevice::do_host_mapping_gated`.
++///
++/// Its prologue moves `this` to x19, the request type (w2) to x20 and the
++/// `MappingInternal*` (x1) to x21, and none of the three is reassigned before
++/// `str x8, [x9, #0x1018]`, the producer store. At that store x22 holds the
++/// ring slot's byte offset, which is why the baseline layout reads it there.
++pub const MAPPER_CAPTURE_REGS_MACOS27: MapperCaptureRegs = MapperCaptureRegs {
++    mapper_device: 19,
++    request_type: 20,
++    mapping_internal: 21,
++};
++
++/// Every recovered handoff, in the order a capture tries them.
++///
++/// These are closed contracts recovered from guest builds, not a register
++/// search: a layout is accepted only when its request type equals the ring
++/// entry's and its `MappingInternal*` validates against the entry's mapping id
++/// and the mapper device. A guest none of them describes is refused.
++pub const MAPPER_CAPTURE_LAYOUTS: [MapperCaptureRegs; 2] =
++    [MAPPER_CAPTURE_REGS_BASELINE, MAPPER_CAPTURE_REGS_MACOS27];
++
+ pub const ROW_BYTES_ALIGN: u64 = 128;
+ pub const DEVICE_PLANE_DESC_LEN: usize = 0x40;
+ pub const DEVICE_PLANE_OFFSET: usize = 0x08;
+diff --git a/crates/reims-vgpu/src/runtime/mapper/mod.rs b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+index 835e7c9..e957b19 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+@@ -1,7 +1,8 @@
+ //! IOSurface mapper capture + page-table / geometry resolve.
+ //!
+-//! Capture runs on the iosfc producer MMIO path (guest x19/x21/x22 still hold
+-//! the directed handoff from `do_host_mapping_gated`). Resolve builds
++//! Capture runs on the iosfc producer MMIO path (the guest's callee-saved
++//! registers still hold the directed handoff from `do_host_mapping_gated`, in
++//! one of the recovered `MAPPER_CAPTURE_LAYOUTS`). Resolve builds
+ //! `MappingEntry.page_entries` and geometry from MappingInternal + device
+ //! descriptor via guest KVA reads ([`HostOps::read_kva`]).
+ 
+@@ -12,9 +13,8 @@ use crate::protocol::iosurface_pages::{
+     self, build_table_plan, decode_device_surface, decode_mapper_request_entry, guest_kernel_va,
+     mapper_request_published_entry_offset, mapping_span_bound, read_internal_desc_ptr,
+     read_mapper_identity, read_mapper_internal, validate_mapper_internal, PagesMemory,
+-    DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE, MAPPER_CAPTURE_REG_MAPPING_INTERNAL,
+-    MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
+-    MAPPER_REQUEST_UNMAP,
++    DEVICE_DESC_LEN, MAPPER_CAPTURE_LAYOUTS, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
++    MAPPER_REQUEST_UNMAP, MapperCaptureRegs,
+ };
+ use crate::runtime::host::{HostMemory, HostOps, MemError};
+ 
+@@ -125,22 +125,6 @@ fn clear_resolve_fail(mapping_id: u32) {
+     guard.retain(|(mid, _)| *mid != mapping_id);
+ }
+ 
+-fn capture_xreg_failed(
+-    mapping_id: u32,
+-    producer: u32,
+-    decline: MapperDecline,
+-) -> Option<MapperCapture> {
+-    note_capture_fail(
+-        mapping_id,
+-        crate::observe::Decline::slug(&decline),
+-        crate::observe::Emit::decline("mapper_capture_fail", &decline)
+-            .field("mapping", mapping_id)
+-            .field("producer", producer)
+-            .render(),
+-    );
+-    None
+-}
+-
+ /// Adapter: mapper internals are KVA; page content GPAs use HostMemory.
+ struct MapperMem<'a, H: HostMemory + HostOps> {
+     host: &'a H,
+@@ -212,115 +196,142 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
+     }
+ 
+     // From here the ring entry is a decoded MAP/UNMAP for a valid mapping_id, so
+-    // any failure below is a genuine capture miss (the handoff registers do not
+-    // corroborate the request), not the speculative not-ready poll — log it once
+-    // per (mapping_id, reason). The mapping's MappingInternal never attaches and
+-    // downstream present/Store paints black otherwise.
++    // a request no recovered layout corroborates is a genuine capture miss (the
++    // handoff registers do not match the request), not the speculative not-ready
++    // poll — log it once per (mapping_id, reason). The mapping's MappingInternal
++    // never attaches and downstream present/Store paints black otherwise.
+     let mid = request.mapping_id;
+-    let mapper = match host.read_xreg(MAPPER_CAPTURE_REG_MAPPER_DEVICE) {
+-        Ok(value) => value,
+-        Err(error) => {
+-            let decline = MapperDecline::CaptureMapperXregRead(error);
+-            return capture_xreg_failed(mid, producer, decline);
++    let mut baseline_miss = None;
++    for (index, regs) in MAPPER_CAPTURE_LAYOUTS.iter().enumerate() {
++        match capture_with_layout(host, producer, mid, request.request_type, *regs) {
++            Ok(cap) => {
++                if crate::observe::first_sight("mapper_capture_layout", index as u64) {
++                    crate::observe::off(format!(
++                        "mapper_capture_layout index={index} regs={regs:?} mapping={mid}"
++                    ));
++                }
++                return Some(cap);
++            }
++            // Only the first (baseline) layout's miss is reported, so a guest the
++            // later layouts do not describe logs exactly what it always did.
++            Err(miss) => {
++                baseline_miss.get_or_insert(miss);
++            }
+         }
+-    };
+-    let rtype = match host.read_xreg(MAPPER_CAPTURE_REG_REQUEST_TYPE) {
+-        Ok(value) => value as u32,
+-        Err(error) => {
+-            let decline = MapperDecline::CaptureRequestTypeXregRead(error);
+-            return capture_xreg_failed(mid, producer, decline);
++    }
++    if let Some(miss) = baseline_miss {
++        note_capture_fail(mid, miss.reason, miss.line);
++    }
++    None
++}
++
++/// The line one layout's first failing check would log.
++struct CaptureMiss {
++    reason: &'static str,
++    line: String,
++}
++
++impl CaptureMiss {
++    fn decline(decline: MapperDecline, emit: crate::observe::Emit) -> Self {
++        Self {
++            reason: crate::observe::Decline::slug(&decline),
++            line: emit.render(),
+         }
+-    };
+-    let internal = match host.read_xreg(MAPPER_CAPTURE_REG_MAPPING_INTERNAL) {
+-        Ok(value) => value,
+-        Err(error) => {
+-            let decline = MapperDecline::CaptureInternalXregRead(error);
+-            return capture_xreg_failed(mid, producer, decline);
++    }
++
++    fn refusal(status: &iosurface_pages::Status, emit: crate::observe::Emit) -> Self {
++        Self {
++            reason: refusal_reason(status),
++            line: emit.render(),
+         }
++    }
++}
++
++/// Corroborate the ring request against one recovered register layout.
++fn capture_with_layout<H: HostMemory + HostOps>(
++    host: &H,
++    producer: u32,
++    mid: u32,
++    request_type: u32,
++    regs: MapperCaptureRegs,
++) -> Result<MapperCapture, CaptureMiss> {
++    let xreg_miss = |decline: MapperDecline| {
++        CaptureMiss::decline(
++            decline,
++            crate::observe::Emit::decline("mapper_capture_fail", &decline)
++                .field("mapping", mid)
++                .field("producer", producer),
++        )
+     };
+-    if rtype != request.request_type {
++    let mapper = host
++        .read_xreg(regs.mapper_device)
++        .map_err(|error| xreg_miss(MapperDecline::CaptureMapperXregRead(error)))?;
++    let rtype = host
++        .read_xreg(regs.request_type)
++        .map_err(|error| xreg_miss(MapperDecline::CaptureRequestTypeXregRead(error)))?
++        as u32;
++    let internal = host
++        .read_xreg(regs.mapping_internal)
++        .map_err(|error| xreg_miss(MapperDecline::CaptureInternalXregRead(error)))?;
++    if rtype != request_type {
+         let decline = MapperDecline::CaptureRequestTypeMismatch;
+-        note_capture_fail(
+-            mid,
+-            crate::observe::Decline::slug(&decline),
++        return Err(CaptureMiss::decline(
++            decline,
+             crate::observe::Emit::decline("mapper_capture_fail", &decline)
+                 .field("mapping", mid)
+                 .field("rtype", rtype)
+-                .field("request_type", request.request_type)
+-                .render(),
+-        );
+-        return None;
++                .field("request_type", request_type),
++        ));
+     }
+     if internal == 0 {
+         let decline = MapperDecline::CaptureInternalZero;
+-        note_capture_fail(
+-            mid,
+-            crate::observe::Decline::slug(&decline),
+-            crate::observe::Emit::decline("mapper_capture_fail", &decline)
+-                .field("mapping", mid)
+-                .render(),
+-        );
+-        return None;
++        return Err(CaptureMiss::decline(
++            decline,
++            crate::observe::Emit::decline("mapper_capture_fail", &decline).field("mapping", mid),
++        ));
+     }
+     if !guest_kernel_va(internal) {
+         let decline = MapperDecline::CaptureInternalKvaInvalid;
+-        note_capture_fail(
+-            mid,
+-            crate::observe::Decline::slug(&decline),
++        return Err(CaptureMiss::decline(
++            decline,
+             crate::observe::Emit::decline("mapper_capture_fail", &decline)
+                 .field("mapping", mid)
+-                .field("internal", format!("{internal:#x}"))
+-                .render(),
+-        );
+-        return None;
++                .field("internal", format!("{internal:#x}")),
++        ));
+     }
+     if mapper != 0 && !guest_kernel_va(mapper) {
+         let decline = MapperDecline::CaptureMapperKvaInvalid;
+-        note_capture_fail(
+-            mid,
+-            crate::observe::Decline::slug(&decline),
++        return Err(CaptureMiss::decline(
++            decline,
+             crate::observe::Emit::decline("mapper_capture_fail", &decline)
+                 .field("mapping", mid)
+-                .field("mapper_kva", format!("{mapper:#x}"))
+-                .render(),
+-        );
+-        return None;
++                .field("mapper_kva", format!("{mapper:#x}")),
++        ));
+     }
+ 
+     let mem = MapperMem::new(host);
+-    let fields = match read_mapper_identity(&mem, internal, mapper != 0, mapper) {
+-        Ok(f) => f,
+-        Err(status) => {
+-            let reason = refusal_reason(&status);
+-            note_capture_fail(
+-                mid,
+-                reason,
+-                crate::observe::Emit::refusal("mapper_capture_fail", &status)
+-                    .expect("the error arm cannot carry Status::Ok")
+-                    .field("mapping", mid)
+-                    .field("internal", format!("{internal:#x}"))
+-                    .field("mapper_kva", format!("{mapper:#x}"))
+-                    .render(),
+-            );
+-            return None;
+-        }
+-    };
++    let fields = read_mapper_identity(&mem, internal, mapper != 0, mapper).map_err(|status| {
++        CaptureMiss::refusal(
++            &status,
++            crate::observe::Emit::refusal("mapper_capture_fail", &status)
++                .expect("the error arm cannot carry Status::Ok")
++                .field("mapping", mid)
++                .field("internal", format!("{internal:#x}"))
++                .field("mapper_kva", format!("{mapper:#x}")),
++        )
++    })?;
+     let status = validate_mapper_internal(&mem, mid, &fields);
+     if status != iosurface_pages::Status::Ok {
+-        let reason = refusal_reason(&status);
+-        note_capture_fail(
+-            mid,
+-            reason,
++        return Err(CaptureMiss::refusal(
++            &status,
+             crate::observe::Emit::refusal("mapper_capture_fail", &status)
+                 .expect("the non-Ok branch must carry a refusal")
+                 .field("mapping", mid)
+-                .field("internal", format!("{internal:#x}"))
+-                .render(),
+-        );
+-        return None;
++                .field("internal", format!("{internal:#x}")),
++        ));
+     }
+ 
+-    Some(MapperCapture {
++    Ok(MapperCapture {
+         producer,
+         mapper_device_kva: mapper,
+         request_type: rtype,
+diff --git a/crates/reims-vgpu/src/runtime/mapper/tests.rs b/crates/reims-vgpu/src/runtime/mapper/tests.rs
+index 4458cb3..a057dbb 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/tests.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/tests.rs
+@@ -483,6 +483,8 @@ fn mapping_offsets_of_pages_maps_guest_pages_to_surface_offsets() {
+ use super::*;
+ use crate::protocol::endian::st32;
+ use crate::protocol::iosurface_pages::{
++    MAPPER_CAPTURE_REGS_MACOS27, MAPPER_CAPTURE_REG_MAPPER_DEVICE,
++    MAPPER_CAPTURE_REG_MAPPING_INTERNAL, MAPPER_CAPTURE_REG_REQUEST_TYPE,
+     MAPPING_INTERNAL_BACKPTR, MAPPING_INTERNAL_EXPECTED_SIZE, MAPPING_INTERNAL_ID,
+     MAPPING_INTERNAL_SIZE, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
+ };
+@@ -724,6 +726,63 @@ fn capture_handoff_mismatch_is_fail_visible_and_latched() {
+     assert!(!seen(9, "mapper_capture_request_type_mismatch"));
+ }
+ 
++/// A MAP for `mapping_id` published at producer 1, with a MappingInternal at
++/// `internal` whose identity names `internal_id` and `mapper` as its owner.
++fn macos27_fixture(ring: u64, mapping_id: u32, internal: u64, internal_id: u32, mapper: u64) -> (DeviceState, FakeHost) {
++    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++    let mut host = FakeHost::new();
++    state.iosfc.ring_base = ring;
++    let mut entry = [0u8; 16];
++    st32(&mut entry[0..], MAPPER_REQUEST_MAP);
++    st32(&mut entry[4..], mapping_id);
++    host.map_range(ring, 16, 0);
++    let _ = host.write_gpa(ring, &entry);
++    put_u64(&mut host, internal + MAPPING_INTERNAL_BACKPTR, mapper);
++    put_u32(&mut host, internal + MAPPING_INTERNAL_ID, internal_id);
++    put_u32(&mut host, internal + MAPPING_INTERNAL_SIZE, MAPPING_INTERNAL_EXPECTED_SIZE);
++    // What macOS 27's do_host_mapping_gated holds at the producer store: x19 the
++    // mapper, x20 the request type, x21 the MappingInternal* and x22 the ring
++    // slot's byte offset. The baseline layout therefore reads a kernel pointer
++    // (x21) as the request type.
++    let regs = MAPPER_CAPTURE_REGS_MACOS27;
++    host.set_xreg(regs.mapper_device, mapper);
++    host.set_xreg(regs.request_type, MAPPER_REQUEST_MAP as u64);
++    host.set_xreg(regs.mapping_internal, internal);
++    host.set_xreg(22, 0x10);
++    (state, host)
++}
++
++#[test]
++fn capture_accepts_the_macos27_handoff_layout() {
++    let (internal, mapper) = (KVA + 0x4000, KVA + 0x5000);
++    let (mut state, host) = macos27_fixture(0x7200_0000, 11, internal, 11, mapper);
++    let cap = capture_at_producer(&state, &host, 1).expect("macOS 27 capture");
++    assert_eq!(
++        (cap.mapping_internal, cap.mapper_device_kva, cap.request_type),
++        (internal, mapper, MAPPER_REQUEST_MAP)
++    );
++    assert!(apply_capture(&mut state, &cap, 11));
++    assert_eq!(state.mappings.get(&11).unwrap().mapping_internal, internal);
++}
++
++#[test]
++fn a_layout_whose_internal_names_another_mapping_is_refused() {
++    // The macOS 27 layout corroborates the request type but its MappingInternal
++    // belongs to mapping 99. No layout may accept that, and the miss reported is
++    // the baseline layout's, exactly what this guest logged before it existed.
++    let (state, host) = macos27_fixture(0x7300_0000, 12, KVA + 0x6000, 99, KVA + 0x7000);
++    let seen = |m: u32, r: &'static str| {
++        resolve_fail_latch()
++            .lock()
++            .unwrap_or_else(|e| e.into_inner())
++            .contains(&(m, r))
++    };
++    clear_resolve_fail(12);
++    assert!(capture_at_producer(&state, &host, 1).is_none());
++    assert!(seen(12, "mapper_capture_request_type_mismatch"));
++    assert!(!seen(12, "iosurface_validate_mapping_id_mismatch"));
++}
++
+ /// A mapping id 3 whose internal object resolves to exactly one valid page,
+ /// attached and ready for `resolve_mapping_backing`.
+ ///

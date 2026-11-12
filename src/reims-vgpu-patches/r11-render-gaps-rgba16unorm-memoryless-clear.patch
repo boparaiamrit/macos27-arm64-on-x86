@@ -1,0 +1,439 @@
+--- a/crates/reims-vgpu-protocol/src/pixel_format.rs
++++ b/crates/reims-vgpu-protocol/src/pixel_format.rs
+@@ -409,6 +409,13 @@
+     ///
+     /// See [`TexelLayout::Rgba32Float`] for why it is native-or-nothing.
+     Rgba32Float,
++    /// Four little-endian `unorm16` channels in R,G,B,A order — `MTLPixelFormatRGBA16Unorm`,
++    /// eight bytes a texel, already in `R16G16B16A16_UNORM`'s upload order.
++    ///
++    /// Native-or-nothing on [`Self::Rgba32Float`]'s terms: [`TexelLayout::Rgba16Unorm`] has no
++    /// CPU loader arm, because an eight-bit one would discard the low byte of every channel, so
++    /// a host that cannot sample the layout refuses the bind by name instead.
++    Rgba16Unorm,
+ }
+ 
+ /// The byte layout of one guest texel on the sampled rails, independent of any
+@@ -1804,6 +1811,7 @@
+         MTL_FORMAT_BGR10A2_UNORM => SampledClass::Bgr10a2Unorm,
+         MTL_FORMAT_RG16_UINT => SampledClass::Rg16Uint,
+         MTL_FORMAT_RGBA32_FLOAT => SampledClass::Rgba32Float,
++        MTL_FORMAT_RGBA16_UNORM => SampledClass::Rgba16Unorm,
+         _ => return None,
+     })
+ }
+@@ -3961,6 +3969,7 @@
+                 SampledClass::Bgr10a2Unorm => TexelLayout::Bgr10a2Unorm,
+                 SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
+                 SampledClass::Rgba32Float => TexelLayout::Rgba32Float,
++                SampledClass::Rgba16Unorm => TexelLayout::Rgba16Unorm,
+             });
+             // Renderable, single-channel, and named by neither table above —
+             // admitted for macOS 26's blur intermediate.
+--- a/crates/reims-vgpu/src/runtime/draw/texture_view.rs
++++ b/crates/reims-vgpu/src/runtime/draw/texture_view.rs
+@@ -826,6 +826,18 @@
+     /// `SAMPLED_IMAGE_FILTER_LINEAR`, so the filter is measured rather than
+     /// assumed.
+     pub float32: bool,
++    /// Upload guest four-channel sixteen-bit normalized colour
++    /// (`RGBA16Unorm`) at its own eight bytes, as `R16G16B16A16_UNORM`.
++    ///
++    /// The only rail, on [`Self::float32`]'s terms:
++    /// [`pixel_format::TexelLayout::Rgba16Unorm`] has no CPU loader arm, so a
++    /// host that clears this flag loses the texture and says so rather than
++    /// narrowing every channel to eight bits.
++    ///
++    /// Its own flag because Vulkan mandates neither `SAMPLED_IMAGE` nor
++    /// `SAMPLED_IMAGE_FILTER_LINEAR` for the sixteen-bit normalized formats, so
++    /// set from `supports_sampled_layout_linear_filter(Rgba16Unorm)`.
++    pub unorm16: bool,
+ }
+ 
+ impl NativeUploads {
+@@ -836,6 +848,7 @@
+         float16: false,
+         block_compressed: false,
+         float32: false,
++        unorm16: false,
+     };
+ 
+     /// Native BGRA8 only — the answer this parameter carried when it was a
+@@ -852,6 +865,7 @@
+         float16: false,
+         block_compressed: false,
+         float32: false,
++        unorm16: false,
+     };
+ 
+     /// Every native layout the loaders can produce — every gate open at once.
+@@ -876,6 +890,7 @@
+         float16: true,
+         block_compressed: true,
+         float32: true,
++        unorm16: true,
+     };
+ }
+ 
+@@ -941,6 +956,7 @@
+         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
+         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
+         SampledClass::Rgba32Float if native.float32 => TexelLayout::Rgba32Float,
++        SampledClass::Rgba16Unorm if native.unorm16 => TexelLayout::Rgba16Unorm,
+         // Ungated, like `Rgba8Unorm` and unlike every layout above it. Vulkan
+         // mandates `SAMPLED_IMAGE` for `R16G16_UINT`, and the one capability
+         // the other native layouts are gated on — linear filtering — is not a
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -5249,6 +5249,9 @@
+         // filter by mandate. So this one is genuinely a per-host answer and the
+         // conjunction above would hide it.
+         float32: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba32Float),
++        // Asked per host for `float32`'s reason, and more so: Vulkan mandates
++        // neither the sample nor the linear filter for `R16G16B16A16_UNORM`.
++        unorm16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Unorm),
+         ..NativeUploads::BGRA8
+     }
+ }
+--- a/crates/reims-vgpu/src/runtime/draw/render_target.rs
++++ b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+@@ -911,7 +911,18 @@
+     // These are the guest-declared actions, before the encoder's internal
+     // continuation template changes later draws to LOAD. That internal LOAD
+     // preserves this pass's content and does not widen this declared contract.
+-    if att.load_action != crate::protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE {
++    //
++    // DontCare and Clear are the two load actions a memoryless attachment can
++    // declare, and neither reads prior contents: Clear is the engine's
++    // attachment clear to the declared colour, which `mrt_draw_request`
++    // already carries for a memoryless target without seeding it from guest
++    // bytes. Only Load — the one action that would need contents from before
++    // the pass — stays refused.
++    if !matches!(
++        att.load_action,
++        crate::protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE
++            | crate::protocol::pass_action::MTL_LOAD_ACTION_CLEAR
++    ) {
+         return refuse(
+             state,
+             C::MemorylessLoadAction {
+--- a/crates/reims-vgpu/src/runtime/draw/tests.rs
++++ b/crates/reims-vgpu/src/runtime/draw/tests.rs
+@@ -2022,6 +2022,36 @@
+     ));
+ }
+ 
++/// A four-channel sixteen-bit normalized linear texture binds natively, and
++/// only natively.
++///
++/// The Golden Gate defect: a full-screen WindowServer draw samples a 128x128
++/// `RGBA16Unorm` linear texture and every bind was refused with
++/// `draw_prepare_texture_resolve_missing … reason=linear_sample`. On a host
++/// with no stable guest-page alias the zero-copy rung is off, and the byte
++/// rungs had neither a native layout nor a convert arm for the format. The
++/// native layout is the guest's own eight bytes; there is still no convert arm,
++/// because an eight-bit one would drop the low byte of every channel.
++#[test]
++fn a_sixteen_bit_normalized_sampled_texture_is_native_or_refused() {
++    assert_eq!(
++        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA16_UNORM, NativeUploads::ALL),
++        Some(TexelLayout::Rgba16Unorm)
++    );
++    assert_eq!(
++        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA16_UNORM, NativeUploads::BGRA8),
++        None,
++        "a host that cannot sample it must not get a native bind"
++    );
++    assert_eq!(
++        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA16_UNORM, NativeUploads::NONE),
++        None
++    );
++    assert_eq!(TexelLayout::Rgba16Unorm.bytes_per_texel(), 8);
++    assert!(!TexelLayout::Rgba16Unorm.has_cpu_loader_arm());
++    assert!(pixel_format::RowToRgba8::for_format(pixel_format::MTL_FORMAT_RGBA16_UNORM).is_none());
++}
++
+ /// The host-gated set is derived from the loader, not approximated by a second
+ /// list.
+ ///
+@@ -2039,6 +2069,7 @@
+         pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+         pixel_format::MTL_FORMAT_RG16_FLOAT,
+         pixel_format::MTL_FORMAT_BC7_RGBA_UNORM,
++        pixel_format::MTL_FORMAT_RGBA16_UNORM,
+     ] {
+         assert!(
+             super::texture_view::native_bind_is_host_gated(gated),
+@@ -2870,6 +2901,89 @@
+     assert!(!req.gva_load_from_resident);
+ }
+ 
++/// The same captured memoryless shape declaring `MTLLoadActionClear`, which the
++/// Golden Gate guest does (`rt_resolve reason=rt_memoryless_load_action value=2`).
++/// Clear reads no prior contents, so it is inside the memoryless contract: the
++/// attachment resolves and the request clears to the declared colour, still
++/// with no seed from guest pages.
++#[test]
++fn mrt_draw_request_memoryless_clear_is_seedless_and_carries_its_colour() {
++    use crate::protocol::endian::st32;
++    use crate::protocol::pass_action::MTL_LOAD_ACTION_CLEAR;
++    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
++    use crate::runtime::gva_mem;
++    use crate::runtime::render_pass::ColorAttachment;
++
++    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++    let mut host = FakeHost::new();
++    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
++    assert!(state.set_object_list(1, 0, 256));
++    let tex_ref = 201u32;
++    let words: [u32; 11] = [
++        1,
++        44,
++        tex_ref,
++        0x0073_0542,
++        1920,
++        1080,
++        1,
++        0x0001_0001,
++        0x0030_0001,
++        0,
++        0,
++    ];
++    let mut desc = vec![0u8; 44];
++    for (i, word) in words.iter().enumerate() {
++        st32(&mut desc[i * 4..], *word);
++    }
++    write_task_gva_arm64e(&mut host, &state.tasks[1], 0x280, &desc);
++    let off = list_object_entry_offset(tex_ref, 256).expect("ref is inside the list");
++    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
++    st32(&mut entry[0..], 9 | ((desc.len() as u32) << 8));
++    entry[4..12].copy_from_slice(&0x280u64.to_le_bytes());
++    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &entry);
++
++    let clear_color = [0.25, 0.5, 0.75, 1.0];
++    let att = ColorAttachment {
++        texture_ref: tex_ref,
++        resolve_texture_ref: 0,
++        level: 0,
++        slice: 0,
++        depth_plane: 0,
++        load_action: MTL_LOAD_ACTION_CLEAR,
++        store_action: 0,
++        clear_color,
++    };
++    let slots = [(0u32, att)];
++    let captured = crate::observe::FailCapture::start();
++    let req = mrt_draw_request(&mut state, &mut host, 1, 1, &slots, &[], test_triangle())
++        .expect("a memoryless Clear is inside the contract and must build a draw request");
++    assert!(
++        captured
++            .lines()
++            .iter()
++            .all(|line| !line.contains("rt_memoryless_load_action")),
++        "Clear is not a refused memoryless load action: {:?}",
++        captured.lines()
++    );
++    assert!(req.colors[0].memoryless);
++    assert!(req.memoryless_pass.is_some());
++    assert!(
++        req.colors[0].target_seed_rgba.is_none(),
++        "the clear is the engine's attachment clear, never a seed from guest pages"
++    );
++    assert_eq!(req.colors[0].load_action, MTL_LOAD_ACTION_CLEAR);
++    assert_eq!(req.colors[0].clear_color, clear_color);
++    assert_eq!(
++        (
++            req.colors[0].width,
++            req.colors[0].height,
++            req.colors[0].format
++        ),
++        (1920, 1080, 0x73)
++    );
++}
++
+ #[cfg(feature = "backend-vulkan")]
+ #[test]
+ fn memoryless_secondary_requires_a_pass_and_cannot_alias_another_pass() {
+@@ -4044,6 +4158,143 @@
+     assert_ne!(id3.expect("identity").generation, id1.generation);
+ }
+ 
++/// A guest-CPU `RGBA16Unorm` linear texture with a declared mip chain — the
++/// shape the Golden Gate guest's full-screen draw samples (five levels, a
++/// 260-byte descriptor, tight rows) — loads on the byte rung at its own eight
++/// bytes a texel, every channel exact.
++///
++/// The rung uploads one 2D image, as it does for every format: the image is the
++/// base level, which is the level a magnified sample reads. The values cover
++/// both ends of each channel's range and adjacent words (65534/65535), which an
++/// eight-bit or half-float path would merge.
++#[cfg(feature = "backend-vulkan")]
++#[test]
++fn rgba16_unorm_mip_chain_linear_texture_loads_its_base_level_natively() {
++    use crate::protocol::endian::{st16, st32, st64};
++    use crate::protocol::pixel_format::MTL_FORMAT_RGBA16_UNORM;
++    use crate::runtime::decode::resource::{
++        list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
++        RESOURCE_PAGE_SHIFT, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT,
++        TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
++        TEXTURE_DESC_MIP_LEVEL_RECORD_LEN, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
++        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET,
++        TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
++    };
++    use crate::runtime::gva_mem;
++    use reims_vgpu_protocol::extent::mip_extent;
++
++    const BASE: u32 = 16;
++    const LEVELS: u32 = 5; // 16, 8, 4, 2, 1
++    const BPP: u32 = 8;
++    let stride = |level: u32| u64::from(mip_extent(BASE, level) * BPP);
++
++    let mut host = FakeHost::new();
++    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
++    assert!(state.set_object_list(1, 0, 32));
++
++    // Level 0 carries the checked words; the smaller levels carry a marker the
++    // base-level read must not return.
++    let words: [u16; 8] = [0, 1, 32767, 32768, 65534, 65535, 0x1234, 0xfedc];
++    let handle = 5u64;
++    let base_gva = handle << RESOURCE_PAGE_SHIFT;
++    let mut offsets = Vec::new();
++    let mut image = Vec::new();
++    let mut level0 = Vec::new();
++    for level in 0..LEVELS {
++        offsets.push(image.len() as u64);
++        let side = mip_extent(BASE, level);
++        for y in 0..side {
++            for x in 0..side {
++                for c in 0..4u32 {
++                    let word = if level == 0 {
++                        words[((x + y + c) % 8) as usize]
++                    } else {
++                        0xA5A5
++                    };
++                    image.extend_from_slice(&word.to_le_bytes());
++                    if level == 0 {
++                        level0.extend_from_slice(&word.to_le_bytes());
++                    }
++                }
++            }
++        }
++    }
++    let allocation_size = 1u64 << RESOURCE_PAGE_SHIFT;
++    assert!(image.len() as u64 <= allocation_size);
++    write_task_gva_arm64e(&mut host, &state.tasks[1], base_gva, &image);
++
++    let desc_len =
++        TEXTURE_DESC_BASE_LEN + (LEVELS as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
++    assert_eq!(desc_len, 260, "the guest's five-level descriptor length");
++    let mut desc = vec![0u8; desc_len];
++    st64(&mut desc[LINEAR_DESC_SIZE..], allocation_size);
++    st64(&mut desc[LINEAR_DESC_HANDLE..], handle);
++    desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT] = LEVELS as u8;
++    st32(
++        &mut desc[TEXTURE_DESC_USED_SIZE..],
++        (stride(0) * u64::from(BASE)) as u32,
++    );
++    st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], stride(0) as u32);
++    st32(&mut desc[TEXTURE_DESC_WIDTH..], BASE);
++    st32(&mut desc[TEXTURE_DESC_HEIGHT..], BASE);
++    for level in 1..LEVELS {
++        let rec =
++            TEXTURE_DESC_LEVEL_RECORDS + (level as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
++        let side = mip_extent(BASE, level);
++        st64(
++            &mut desc[rec + TEXTURE_LEVEL_OFFSET..],
++            offsets[level as usize],
++        );
++        st64(
++            &mut desc[rec + TEXTURE_LEVEL_SIZE..],
++            stride(level) * u64::from(side),
++        );
++        st64(&mut desc[rec + TEXTURE_LEVEL_ROW_STRIDE..], stride(level));
++        st32(&mut desc[rec + TEXTURE_LEVEL_WIDTH..], side);
++        st32(&mut desc[rec + TEXTURE_LEVEL_HEIGHT..], side);
++    }
++    let pf_off =
++        TEXTURE_DESC_PIXEL_FORMAT + (LEVELS as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
++    st16(&mut desc[pf_off..], MTL_FORMAT_RGBA16_UNORM);
++    let desc_gva = 0x2000u64;
++    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
++    let tex_ref = 11u32;
++    let off = list_object_entry_offset(tex_ref, 32).unwrap();
++    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
++    st32(
++        &mut le[0..],
++        (OBJECT_TYPE_TEXTURE as u32) | ((desc.len() as u32) << 8),
++    );
++    le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
++    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
++
++    let le_entry = objects::lookup_list_entry(&state, &host, 1, tex_ref)
++        .expect("object-list entry must resolve");
++    let td = decode_texture_descriptor(
++        &objects::read_descriptor(&state, &host, 1, &le_entry).expect("descriptor must read"),
++    )
++    .expect("descriptor must decode");
++    assert_eq!(td.mipmap_level_count, LEVELS);
++    assert_eq!(td.declared_pixel_format(), Some(MTL_FORMAT_RGBA16_UNORM));
++
++    let (w, h, bytes, identity, format) =
++        load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &td)
++            .expect("an RGBA16Unorm linear texture must load on the byte rung");
++    assert_eq!((w, h), (BASE, BASE));
++    assert_eq!(
++        format,
++        SampledByteFormat::from_source(TexelLayout::Rgba16Unorm, MTL_FORMAT_RGBA16_UNORM),
++        "uploaded at its own eight bytes, never narrowed"
++    );
++    assert_eq!(
++        bytes.as_slice(),
++        level0.as_slice(),
++        "the base level's words, exact"
++    );
++    assert!(identity.is_some(), "the memo carries a content identity");
++}
++
+ /// Padded-stride BGRA8 (the Safari-scroll former `lin_guest_fb` hot path)
+ /// now rides the guest-linear memo (gva recurrence measured ~99% under
+ /// scroll). Assert it uploads the guest's NATIVE BGRA8 bytes (`byte_format
+--- a/crates/reims-vgpu/src/runtime/draw/memoryless_observation.rs
++++ b/crates/reims-vgpu/src/runtime/draw/memoryless_observation.rs
+@@ -324,15 +324,17 @@
+             let e = super::super::resolve_render_target(&mut self.state, &self.host, 1, self.att)
+                 .expect_err("observation must not accept a target");
+             assert_eq!(e.base_ref, TEXTURE_REF);
+-            // Tag 9 has its own rung now: this fixture's declared Clear action
+-            // is outside the admitted DontCare contract and is checked before
+-            // its other unsupported fields. Every other type still lands on
+-            // WrongType exactly as before.
++            // Tag 9 has its own rung now: this fixture's declared Clear load
++            // action is inside the admitted DontCare/Clear contract, so its
++            // first unsupported field is the store action it declares, checked
++            // before the others. Every other type still lands on WrongType
++            // exactly as before.
+             if expected_type == OBJECT_TYPE_MEMORYLESS_TEXTURE {
+                 assert!(
+                     matches!(
+                         e.cause,
+-                        super::super::RenderTargetCause::MemorylessLoadAction { value: 2 }
++                        super::super::RenderTargetCause::MemorylessStoreAction { value }
++                        if value == self.att.store_action
+                     ),
+                     "tag 9 must refuse at its own contract check: {:?}",
+                     e.cause
+@@ -420,8 +422,11 @@
+         }
+         let original = cap.one("rt_resolve");
+         // The original typed refusal remains visible after observation; the
+-        // first unsupported field is the declared Clear load action.
+-        assert!(original.contains("reason=rt_memoryless_load_action base=11 value=2 task=1 ref=11"));
++        // declared Clear load action is admitted, so the first unsupported
++        // field is the store action.
++        assert!(
++            original.contains("reason=rt_memoryless_store_action base=11 value=3 task=1 ref=11")
++        );
+         assert!(lines.iter().position(|l| l == &original).unwrap() > 0);
+         assert_eq!(f.host.writes, 0);
+     }

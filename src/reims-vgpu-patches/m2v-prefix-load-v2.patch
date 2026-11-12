@@ -1,0 +1,518 @@
+diff --git a/src/native/emitter/body/mod.rs b/src/native/emitter/body/mod.rs
+index 0484574..ba83455 100644
+--- a/src/native/emitter/body/mod.rs
++++ b/src/native/emitter/body/mod.rs
+@@ -270,6 +270,32 @@ fn leading_vector_store_target(pointee: &LlType) -> Option<(LlType, Vec<u32>)> {
+     first_aggregate_leaf(pointee, &|t| matches!(t, LlType::Vector(_, _)), false)
+ }
+ 
++/// The leading lanes of `vector_ty` that a narrower numeric-vector load of `result_ty` at the
++/// vector's address reads: `Some((k, prefix_ty))` when the result is exactly `k` whole lanes with
++/// `2 <= k < lanes`, so its bits are the bits of lanes `0..k`; `prefix_ty` is `<k x elem>`. `None`
++/// when the result reaches past the vector, splits a lane, or the prefix and the result cannot be
++/// related by one `OpBitcast` (SPIR-V needs one component count to divide the other). A one-lane
++/// result is the first scalar leaf, which `emit_first_scalar_aggregate_reinterpret_load` already
++/// reads without loading the whole vector.
++fn leading_vector_prefix(vector_ty: &LlType, result_ty: &LlType) -> Option<(u32, LlType)> {
++    let (LlType::Vector(elem, lanes), LlType::Vector(result_elem, result_lanes)) =
++        (vector_ty, result_ty)
++    else {
++        return None;
++    };
++    let lane_bits = bitcast_width(elem).filter(|bits| *bits >= 8)?;
++    let result_bits = bitcast_width(result_elem).filter(|bits| *bits >= 8)? * result_lanes;
++    if result_bits % lane_bits != 0 {
++        return None;
++    }
++    let prefix = result_bits / lane_bits;
++    let (fewer, more) = (prefix.min(*result_lanes), prefix.max(*result_lanes));
++    if prefix < 2 || prefix >= *lanes || more % fewer != 0 {
++        return None;
++    }
++    Some((prefix, LlType::Vector(elem.clone(), prefix)))
++}
++
+ #[cfg(test)]
+ mod binary_dispatch_tests {
+     //! Guard the structured binary dispatch table (`binary_op_dispatch`) against drift: every mnemonic
+diff --git a/src/native/emitter/body/vector_store.rs b/src/native/emitter/body/vector_store.rs
+index e96c8d3..11d5afc 100644
+--- a/src/native/emitter/body/vector_store.rs
++++ b/src/native/emitter/body/vector_store.rs
+@@ -984,6 +984,10 @@ impl Emitter {
+         // result. This covers loading e.g. `<3 x i32>` from a `[4 x <3 x float>]` local (the leading
+         // `<3 x float>` element reinterpreted lane-for-lane), a same-size numeric-vector bitcast that
+         // is legal in Logical addressing (unlike a pointer bitcast).
++        // Prefix case: the result is narrower than the leading vector and is exactly its first `k`
++        // lanes — e.g. a `<4 x half>` read at offset 0 of a union whose leading member is a
++        // `<4 x float>` is the bits of lanes 0 and 1. Load the vector, keep those lanes, then
++        // `OpBitcast` them to the result unless they already have its type.
+         let direct = types_compatible(&vector_ty, result_ty);
+         let bitcast = !direct
+             && matches!(
+@@ -993,7 +997,12 @@ impl Emitter {
+                         && bitcast_width(&vector_ty).is_some()
+                         && bitcast_width(&vector_ty) == bitcast_width(result_ty)
+             );
+-        if !direct && !bitcast {
++        let lane_prefix = if direct || bitcast {
++            None
++        } else {
++            leading_vector_prefix(&vector_ty, result_ty)
++        };
++        if !direct && !bitcast && lane_prefix.is_none() {
+             return Ok(false);
+         }
+ 
+@@ -1005,6 +1014,9 @@ impl Emitter {
+                 ))
+             }
+         };
++        // The prefix case reads the whole leading vector and discards the lanes past the result, the
++        // same over-read `emit_narrowing_vector_load` performs for every storage class. The kept
++        // lanes are exactly the bytes the source load reads.
+         let vector_ptr_ty = self.ptr_type_id(storage, &vector_ty)?;
+         let vector_ptr = self.fresh();
+         let mut ops = vec![Operand::IdRef(ptr)];
+@@ -1026,21 +1038,48 @@ impl Emitter {
+                 Some(result),
+                 vec![Operand::IdRef(vector_ptr)],
+             ));
+-        } else {
+-            // Load the leading vector in its own type, then bitcast lane-for-lane to the result.
+-            let vector_type = self.type_id(&vector_ty)?;
+-            let loaded = self.fresh();
++            return Ok(true);
++        }
++        // Load the leading vector in its own type.
++        let vector_type = self.type_id(&vector_ty)?;
++        let loaded = self.fresh();
++        instructions.push(Self::inst(
++            Op::Load,
++            Some(vector_type),
++            Some(loaded),
++            vec![Operand::IdRef(vector_ptr)],
++        ));
++        let Some((prefix_lanes, prefix_ty)) = lane_prefix else {
++            // Same lane count: bitcast lane-for-lane to the result.
+             instructions.push(Self::inst(
+-                Op::Load,
+-                Some(vector_type),
+-                Some(loaded),
+-                vec![Operand::IdRef(vector_ptr)],
++                Op::Bitcast,
++                Some(result_type),
++                Some(result),
++                vec![Operand::IdRef(loaded)],
+             ));
++            return Ok(true);
++        };
++        // Keep lanes `0..prefix_lanes`.
++        let same_type = types_compatible(&prefix_ty, result_ty);
++        let (prefix_type, kept) = if same_type {
++            (result_type, result)
++        } else {
++            (self.type_id(&prefix_ty)?, self.fresh())
++        };
++        let mut shuffle = vec![Operand::IdRef(loaded), Operand::IdRef(loaded)];
++        shuffle.extend((0..prefix_lanes).map(Operand::LiteralBit32));
++        instructions.push(Self::inst(
++            Op::VectorShuffle,
++            Some(prefix_type),
++            Some(kept),
++            shuffle,
++        ));
++        if !same_type {
+             instructions.push(Self::inst(
+                 Op::Bitcast,
+                 Some(result_type),
+                 Some(result),
+-                vec![Operand::IdRef(loaded)],
++                vec![Operand::IdRef(kept)],
+             ));
+         }
+         Ok(true)
+diff --git a/src/native/tests/buffers.rs b/src/native/tests/buffers.rs
+index eb4e25e..0bff267 100644
+--- a/src/native/tests/buffers.rs
++++ b/src/native/tests/buffers.rs
+@@ -7260,6 +7260,379 @@ entry:
+     assert!(!asm.contains("OpBitcast %_ptr_"), "{asm}");
+ }
+ 
++/// Result id of `OpTypeVector` over an `OpTypeFloat` of `bits`, with `lanes` components.
++fn float_vector_type(module: &Module, bits: u32, lanes: u32) -> Option<Word> {
++    let declared = |opcode: Op, operands: &[Operand]| {
++        module
++            .types_global_values
++            .iter()
++            .find(|inst| inst.class.opcode == opcode && inst.operands == operands)
++            .and_then(|inst| inst.result_id)
++    };
++    let elem = declared(Op::TypeFloat, &[Operand::LiteralBit32(bits)])?;
++    declared(
++        Op::TypeVector,
++        &[Operand::IdRef(elem), Operand::LiteralBit32(lanes)],
++    )
++}
++
++/// A union lowered as `{ { <4 x float>, <4 x half>, [8 x i8] }, [32 x i8] }`, written through its
++/// leading `<4 x float>` and read back at offset 0 as `<4 x half>`: those 8 bytes are lanes 0 and 1 of
++/// the stored `float4`. Logical addressing cannot re-type the pointer, so the load access-chains to the
++/// leading vector the store wrote, loads it, keeps lanes 0 and 1, and bitcasts that `<2 x float>` to
++/// `<4 x half>`. Without this the emitter fell back with "cannot reinterpret load … non-bitcastable
++/// pointee Struct(…) to Vector(Half, 4)".
++#[test]
++fn native_leading_vector_aggregate_load_reinterprets_narrower_prefix() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++%struct.pair = type { <4 x float>, <4 x half>, [8 x i8] }
++%union.pun = type { %struct.pair, [32 x i8] }
++define void @k(ptr addrspace(1) %src, ptr addrspace(1) %dst) {
++entry:
++  %u = alloca %union.pun, align 16
++  %value = load <4 x float>, ptr addrspace(1) %src, align 16
++  store <4 x float> %value, ptr %u, align 16
++  %h = load <4 x half>, ptr %u, align 16
++  store <4 x half> %h, ptr addrspace(1) %dst, align 8
++  ret void
++}
++
++!air.kernel = !{!0}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"src"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"half4", !"air.arg_name", !"dst"}
++"#;
++    let spv = emit_vulkan_spirv(ll).expect("native emit");
++    let module = load_bytes(&spv).expect("load native spv");
++    let float4 = float_vector_type(&module, 32, 4).expect("float4 type");
++    let float2 = float_vector_type(&module, 32, 2).expect("float2 type");
++    let half4 = float_vector_type(&module, 16, 4).expect("half4 type");
++    let body: Vec<&Instruction> = module
++        .functions
++        .iter()
++        .flat_map(|function| function.all_inst_iter())
++        .collect();
++    let defining = |id: Word| {
++        body.iter()
++            .copied()
++            .find(|inst| inst.result_id == Some(id))
++            .unwrap_or_else(|| panic!("no definition of %{id}"))
++    };
++    let operand_id = |inst: &Instruction, index: usize| match inst.operands.get(index) {
++        Some(Operand::IdRef(id)) => *id,
++        other => panic!("operand {index} of {inst:?} is not an id: {other:?}"),
++    };
++
++    let cast = body
++        .iter()
++        .copied()
++        .find(|inst| inst.class.opcode == Op::Bitcast && inst.result_type == Some(half4))
++        .expect("half4 is produced by a bitcast");
++    let prefix = defining(operand_id(cast, 0));
++    assert_eq!(prefix.class.opcode, Op::VectorShuffle, "{prefix:?}");
++    assert_eq!(prefix.result_type, Some(float2), "{prefix:?}");
++    assert_eq!(
++        &prefix.operands[2..],
++        &[Operand::LiteralBit32(0), Operand::LiteralBit32(1)],
++        "the half4 is lanes 0 and 1: {prefix:?}"
++    );
++    let loaded = defining(operand_id(prefix, 0));
++    assert_eq!(loaded.class.opcode, Op::Load, "{loaded:?}");
++    assert_eq!(loaded.result_type, Some(float4), "{loaded:?}");
++
++    let store = body
++        .iter()
++        .copied()
++        .find(|inst| {
++            inst.class.opcode == Op::Store
++                && matches!(inst.operands.get(1), Some(Operand::IdRef(object))
++                if body.iter().any(|def| {
++                    def.result_id == Some(*object) && def.result_type == Some(float4)
++                }))
++        })
++        .expect("float4 store");
++    let written = defining(operand_id(store, 0));
++    let read = defining(operand_id(loaded, 0));
++    assert_eq!(read.class.opcode, Op::InBoundsAccessChain, "{read:?}");
++    assert_eq!(
++        read.operands, written.operands,
++        "the load reads the leading vector the store wrote"
++    );
++
++    // The complete kernel (entry point, interface, capabilities) must validate: a `<2 x float>` to
++    // `<4 x half>` bitcast is legal only with equal total width and dividing component counts.
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_native_leading_vector_prefix_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let kernel = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
++    if std::process::Command::new("spirv-val")
++        .arg("--version")
++        .output()
++        .is_ok()
++    {
++        tools::spirv_val_bytes(&kernel, &tmp).expect("spirv-val");
++    }
++    let _ = std::fs::remove_dir_all(&tmp);
++}
++
++/// The same union read through a local pointer into a constant buffer, a device buffer and
++/// threadgroup memory — the shape of the guest's `Local("%N")` operand, whose storage follows its
++/// root. Each read is lanes 0 and 1 of the leading `float4`, bitcast to `<4 x half>`, in a kernel that
++/// validates. Reading the whole leading vector is the over-read `emit_narrowing_vector_load` already
++/// performs for every storage class; the lanes past the result are discarded.
++#[test]
++fn native_leading_vector_aggregate_load_reads_prefix_through_buffer_and_threadgroup_pointers() {
++    let types = "%struct.pair = type { <4 x float>, <4 x half>, [8 x i8] }\n\
++                 %union.pun = type { %struct.pair, [32 x i8] }";
++    let dst = r#"!{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"half4", !"air.arg_name", !"dst"}"#;
++    let buffer_case = |addrspace: u32, access: &str| {
++        format!(
++            r#"target triple = "spirv-unknown-vulkan1.2"
++{types}
++define void @k(ptr addrspace({addrspace}) %src, ptr addrspace(1) %dst) {{
++entry:
++  %u = getelementptr inbounds %union.pun, ptr addrspace({addrspace}) %src, i64 0
++  %h = load <4 x half>, ptr addrspace({addrspace}) %u, align 16
++  store <4 x half> %h, ptr addrspace(1) %dst, align 8
++  ret void
++}}
++
++!air.kernel = !{{!0}}
++!0 = !{{ptr @k, !1, !2}}
++!1 = !{{}}
++!2 = !{{!3, !4}}
++!3 = !{{i32 0, !"air.buffer", !"air.buffer_size", i32 64, !"air.location_index", i32 0, i32 1, !"{access}", !"air.address_space", i32 {addrspace}, !"air.arg_type_size", i32 64, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"pun", !"air.arg_name", !"src"}}
++!4 = {dst}
++"#
++        )
++    };
++    let threadgroup = format!(
++        r#"target triple = "spirv-unknown-vulkan1.2"
++{types}
++@shared = internal addrspace(3) global %union.pun undef, align 16
++define void @k(ptr addrspace(1) %dst) {{
++entry:
++  %u = getelementptr inbounds %union.pun, ptr addrspace(3) @shared, i64 0
++  %h = load <4 x half>, ptr addrspace(3) %u, align 16
++  store <4 x half> %h, ptr addrspace(1) %dst, align 8
++  ret void
++}}
++
++!air.kernel = !{{!0}}
++!0 = !{{ptr @k, !1, !2}}
++!1 = !{{}}
++!2 = !{{!4}}
++!4 = !{{i32 0, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"half4", !"air.arg_name", !"dst"}}
++"#
++    );
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_native_leading_vector_prefix_storage_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    for (case, ll) in [
++        ("constant buffer", buffer_case(2, "air.read")),
++        ("device buffer", buffer_case(1, "air.read_write")),
++        ("threadgroup", threadgroup),
++    ] {
++        let spv = emit_vulkan_spirv(&ll).unwrap_or_else(|error| panic!("{case}: {error}"));
++        let module = load_bytes(&spv).expect("load native spv");
++        let float4 = float_vector_type(&module, 32, 4).expect("float4 type");
++        let float2 = float_vector_type(&module, 32, 2).expect("float2 type");
++        let half4 = float_vector_type(&module, 16, 4).expect("half4 type");
++        let body: Vec<&Instruction> = module
++            .functions
++            .iter()
++            .flat_map(|function| function.all_inst_iter())
++            .collect();
++        let defined_by = |operand: Option<&Operand>| match operand {
++            Some(Operand::IdRef(id)) => body
++                .iter()
++                .copied()
++                .find(|inst| inst.result_id == Some(*id))
++                .unwrap_or_else(|| panic!("{case}: no definition of %{id}")),
++            other => panic!("{case}: not an id operand: {other:?}"),
++        };
++        let cast = body
++            .iter()
++            .copied()
++            .find(|inst| inst.class.opcode == Op::Bitcast && inst.result_type == Some(half4))
++            .unwrap_or_else(|| panic!("{case}: half4 is produced by a bitcast"));
++        let prefix = defined_by(cast.operands.first());
++        assert_eq!(
++            (prefix.class.opcode, prefix.result_type),
++            (Op::VectorShuffle, Some(float2)),
++            "{case}: {prefix:?}"
++        );
++        assert_eq!(
++            &prefix.operands[2..],
++            &[Operand::LiteralBit32(0), Operand::LiteralBit32(1)],
++            "{case}: the half4 is lanes 0 and 1"
++        );
++        let loaded = defined_by(prefix.operands.first());
++        assert_eq!(
++            (loaded.class.opcode, loaded.result_type),
++            (Op::Load, Some(float4)),
++            "{case}: {loaded:?}"
++        );
++        let kernel = crate::translate_sanitized_native(&ll, Stage::Kernel, &tmp)
++            .unwrap_or_else(|error| panic!("{case}: translate: {error}"));
++        if std::process::Command::new("spirv-val")
++            .arg("--version")
++            .output()
++            .is_ok()
++        {
++            tools::spirv_val_bytes(&kernel, &tmp)
++                .unwrap_or_else(|error| panic!("{case}: spirv-val: {error}"));
++        }
++    }
++    let _ = std::fs::remove_dir_all(&tmp);
++}
++
++/// A `<2 x float>` read at offset 0 of an aggregate led by `<4 x float>` is that vector's first two
++/// lanes in their own type: the shuffle yields the result directly, with no bitcast of a value to its
++/// own type (which SPIR-V rejects).
++#[test]
++fn native_leading_vector_aggregate_load_keeps_same_type_prefix() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++%struct.wide = type { <4 x float>, [16 x i8] }
++define <2 x float> @load_leading_pair(<4 x float> %value) {
++entry:
++  %w = alloca %struct.wide, align 16
++  store <4 x float> %value, ptr %w, align 16
++  %p = load <2 x float>, ptr %w, align 16
++  ret <2 x float> %p
++}
++"#;
++    let spv = emit_vulkan_spirv(ll).expect("native emit");
++    let module = load_bytes(&spv).expect("load native spv");
++    let float4 = float_vector_type(&module, 32, 4).expect("float4 type");
++    let float2 = float_vector_type(&module, 32, 2).expect("float2 type");
++    let body: Vec<&Instruction> = module
++        .functions
++        .iter()
++        .flat_map(|function| function.all_inst_iter())
++        .collect();
++    assert!(
++        body.iter().all(|inst| inst.class.opcode != Op::Bitcast),
++        "{body:?}"
++    );
++    let shuffle = body
++        .iter()
++        .copied()
++        .find(|inst| inst.class.opcode == Op::VectorShuffle)
++        .expect("lane prefix shuffle");
++    assert_eq!(shuffle.result_type, Some(float2), "{shuffle:?}");
++    assert_eq!(
++        &shuffle.operands[2..],
++        &[Operand::LiteralBit32(0), Operand::LiteralBit32(1)],
++        "{shuffle:?}"
++    );
++    let Some(Operand::IdRef(loaded)) = shuffle.operands.first() else {
++        panic!("shuffle source: {shuffle:?}");
++    };
++    assert!(
++        body.iter().any(|inst| inst.result_id == Some(*loaded)
++            && inst.class.opcode == Op::Load
++            && inst.result_type == Some(float4)),
++        "the prefix comes from the loaded leading vector: {body:?}"
++    );
++    assert!(
++        body.iter().any(|inst| inst.class.opcode == Op::ReturnValue
++            && inst.operands == [Operand::IdRef(shuffle.result_id.expect("shuffle id"))]),
++        "the shuffled prefix is the loaded value: {body:?}"
++    );
++}
++
++/// A one-lane result (`<2 x half>` is one `float` wide) is the aggregate's first scalar: it keeps the
++/// single-lane load and bitcast of the first-scalar path instead of loading the whole leading vector.
++#[test]
++fn native_leading_vector_aggregate_load_reads_one_lane_result_as_first_scalar() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++%struct.wide = type { <4 x float>, [16 x i8] }
++define <2 x half> @load_first_lane(<4 x float> %value) {
++entry:
++  %w = alloca %struct.wide, align 16
++  store <4 x float> %value, ptr %w, align 16
++  %h = load <2 x half>, ptr %w, align 16
++  ret <2 x half> %h
++}
++"#;
++    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
++    let half2 = float_vector_type(&module, 16, 2).expect("half2 type");
++    let float = module
++        .types_global_values
++        .iter()
++        .find(|inst| {
++            inst.class.opcode == Op::TypeFloat && inst.operands == [Operand::LiteralBit32(32)]
++        })
++        .and_then(|inst| inst.result_id)
++        .expect("float type");
++    let body: Vec<&Instruction> = module
++        .functions
++        .iter()
++        .flat_map(|function| function.all_inst_iter())
++        .collect();
++    assert!(
++        body.iter()
++            .all(|inst| inst.class.opcode != Op::VectorShuffle),
++        "{body:?}"
++    );
++    let cast = body
++        .iter()
++        .find(|inst| inst.class.opcode == Op::Bitcast && inst.result_type == Some(half2))
++        .expect("half2 bitcast");
++    let Some(Operand::IdRef(source)) = cast.operands.first() else {
++        panic!("bitcast source: {cast:?}");
++    };
++    assert!(
++        body.iter().any(|inst| inst.result_id == Some(*source)
++            && inst.class.opcode == Op::Load
++            && inst.result_type == Some(float)),
++        "the half2 is the bits of the first float lane: {body:?}"
++    );
++}
++
++/// The prefix reinterpret reads only bytes the leading vector holds. A result reaching past the
++/// leading vector, or a result that is not a whole number of its lanes, still falls back honestly.
++#[test]
++fn native_leading_vector_aggregate_load_refuses_bytes_outside_the_vector() {
++    let past_the_vector = r#"
++target triple = "spirv-unknown-vulkan1.2"
++%struct.short = type { <2 x half>, [12 x i8] }
++define <4 x half> @load_past_vector() {
++entry:
++  %s = alloca %struct.short, align 16
++  %h = load <4 x half>, ptr %s, align 16
++  ret <4 x half> %h
++}
++"#;
++    let partial_lane = r#"
++target triple = "spirv-unknown-vulkan1.2"
++%struct.pair = type { <4 x float>, <4 x half>, [8 x i8] }
++define <3 x half> @load_partial_lane() {
++entry:
++  %s = alloca %struct.pair, align 16
++  %h = load <3 x half>, ptr %s, align 16
++  ret <3 x half> %h
++}
++"#;
++    for (case, ll) in [
++        ("past the vector", past_the_vector),
++        ("partial lane", partial_lane),
++    ] {
++        let error = emit_vulkan_spirv(ll).expect_err(case);
++        assert!(error.contains("cannot reinterpret load"), "{case}: {error}");
++    }
++}
++
+ #[test]
+ fn native_scalar_array_load_rebuilds_same_shape_vector() {
+     let ll = r#"

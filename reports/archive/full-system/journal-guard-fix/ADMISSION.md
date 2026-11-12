@@ -1,0 +1,20 @@
+# Exact SQLite journal race correction
+
+The cache supervisor used a directory listing followed by individual `lstat` calls while SQLite was creating and deleting its DELETE-mode rollback journal. The supplied real SQLite reproduction confirms two legitimate transient states: the listed journal disappears, or its regular inode reports zero links during unlink. The previous guard treated both as fatal. The production exception did not retain its filename, so this is a confirmed matching code defect; exact attribution of that individual production exception remains inferred.
+
+The fix is limited to the exact `index.sqlite3-journal` entry. Its ENOENT is treated as absence, and its regular zero-link inode is still counted conservatively toward both nominal and allocated disk budgets. Symlinks, additional links, unknown entries and disappearance/zero links of listed persistent entries remain failures. The guard also revalidates cache directory type/device/inode after the scan. It does not compare changing directory timestamps. Startup still permits the cache's original empty/partial initialization states; no new promise that every persistent file must always be listed is made.
+
+Evidence:
+
+- Baseline regression failed: ten tests produced two failures and three errors. Its actual ten-second SQLite churn recorded 45,314 ENOENT and 3,240 zero-link rejections.
+- After the fix, all **40** tests passed: the original thirty NBD/integrity/cancellation tests plus ten journal/directory/budget regressions. The actual churn test requires positive writer commits and guard checks and zero errors. One directory-replacement fixture was narrowed to isolate the final identity check, since an earlier persistent-file ENOENT was also a correct fail-closed result. No production change was needed for that test correction.
+- Independent static review found no verified findings. Frozen corrected common.py SHA-256: `8f1235e080aacc84d3b4060e1be6d7aaf1a6e58e90e67297a4417e1d19215f15`. The other four production files are unchanged. The previous admission and common.py are retained here; authoritative updated pins are in `../read-cache-boot/admission.json`.
+- The stopped cache passed another read-only audit: all 5,957 committed blocks / 390,397,952 bytes, exact source identity, SQLite quick_check, record hashes/bounds/dense slots and whole-file/stat preservation. No journal or unindexed suffix existed. See `cache-audit/REPORT.md` and `result.json`.
+- Only the owned stale proxy Unix socket was removed after confirming the exact container was exited and the entry was a singly linked socket. The same proxy was started with unchanged resources, volumes, image and source. New StartedAt: `2026-10-28T05:34:23.707175165Z`; container ID remains `f640975cae8b2fdeead196cf9771367f179e9ffc3dcfbdbf9cd5f39055884d09`.
+- New verbatim export readiness reports all 5,957 preserved blocks, the same pinned logical source and `all_disk_layers_verified=false`. It is in `stream-ready-read-cache-journal-fixed-live5.json`. Original source backend remains unchanged.
+
+The latest CONTROL AUX is `1a41c3e851a288505fd73a272844022b0e2537dd6af1036bbf5d290eba6a14e9`, overlay `da5e31c4983c544ce11896647530c1ea59540eee5c4adab6e02f99adb85baadf`, identity `329d7805e126d4a31e01757b9a710f7267a44a761df6a5cbc9cd29111def5f8f`. They remain paired; there is no restore or rebase. MAIN remains protected.
+
+Sampler was renewed to PID 128008, started 2026-10-28T05:27:40.7599816Z for four hours, beyond the next run. The 10-GiB floor, sample freshness, source/proxy deadlines, memory/CPU bounds, cache/overlay limits and log budgets are unchanged. No decoder, firmware, guest, GPU or authentication patch was made.
+
+The next gate is one existing 7200-second boot profile through this fixed proxy after CheckOnly. Only the original startup handoff may attach; no second debugger or runtime screenshot is admitted. The practical checklist is seven verified milestones, with reliable service-bootstrap completion at milestone eight still unverified. Graphical display and interaction are separate later milestones.

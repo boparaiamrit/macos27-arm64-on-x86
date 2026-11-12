@@ -1,0 +1,270 @@
+diff --git a/crates/reims-vgpu/src/backend/vulkan/caps/host_pointer.rs b/crates/reims-vgpu/src/backend/vulkan/caps/host_pointer.rs
+index 175bf80..cf1b3c9 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/caps/host_pointer.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/caps/host_pointer.rs
+@@ -361,6 +361,34 @@ pub unsafe fn query(
+     }
+ }
+ 
++/// What `HOST_ALLOCATION_EXT` offers one image shape, asked only where the
++/// extension that spells the handle type is advertised.
++///
++/// [`query`] asks the buffer half of the same question behind the same gate.
++/// The image half is asked by the capability reports in
++/// [`super::linear_sampled`] and [`super::linear_target`], and it used to be
++/// asked unconditionally: naming `HOST_ALLOCATION_EXT` in a
++/// `VkPhysicalDeviceExternalImageFormatInfo` on a device that does not advertise
++/// `VK_EXT_external_memory_host` is invalid usage
++/// (`VUID-VkPhysicalDeviceExternalImageFormatInfo-handleType-parameter`), not a
++/// question whose answer is "no". Mesa's Dozen on Direct3D 12 is such a device,
++/// and the validation layer named the call for every probed format on every
++/// device create. Unasked reads as no import features, which is the truth on
++/// that host: it has no import path for the shape to use.
++///
++/// `ask` makes the `vkGetPhysicalDeviceImageFormatProperties2` call and returns
++/// `None` when the device cannot make the image at all — a "no" for that shape
++/// rather than an error for the boot.
++pub(crate) fn host_allocation_image_features(
++    has_extension: &dyn Fn(&std::ffi::CStr) -> bool,
++    ask: impl FnOnce() -> Option<vk::ExternalMemoryFeatureFlags>,
++) -> vk::ExternalMemoryFeatureFlags {
++    if !has_extension(vk::EXT_EXTERNAL_MEMORY_HOST_NAME) {
++        return vk::ExternalMemoryFeatureFlags::empty();
++    }
++    ask().unwrap_or_default()
++}
++
+ /// The largest single host-pointer import this device will ask any driver for,
+ /// before the device's own limits narrow it further.
+ ///
+@@ -548,6 +576,36 @@ mod tests {
+             .all(|s| s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
+     }
+ 
++    /// `HOST_ALLOCATION_EXT` is spelled by `VK_EXT_external_memory_host`, so a
++    /// device that does not advertise the extension is not asked about it for
++    /// an image either. Naming it there is invalid usage
++    /// (`VUID-VkPhysicalDeviceExternalImageFormatInfo-handleType-parameter`),
++    /// which Mesa's Dozen reported for every probed format on every device
++    /// create: a validation error, not an answer. The question is the closure,
++    /// and it must not run.
++    #[test]
++    fn the_image_import_question_needs_the_extension_that_spells_its_handle_type() {
++        let importable = vk::ExternalMemoryFeatureFlags::IMPORTABLE;
++        let asked = std::cell::Cell::new(0);
++        let ask = || {
++            asked.set(asked.get() + 1);
++            Some(importable)
++        };
++        let none = |_: &std::ffi::CStr| false;
++        let another = |name: &std::ffi::CStr| name == ash::khr::push_descriptor::NAME;
++        let without: [&dyn Fn(&std::ffi::CStr) -> bool; 2] = [&none, &another];
++        for has_extension in without {
++            assert!(host_allocation_image_features(has_extension, ask).is_empty());
++        }
++        assert_eq!(asked.get(), 0, "a device without the extension was asked");
++
++        let advertised = |name: &std::ffi::CStr| name == vk::EXT_EXTERNAL_MEMORY_HOST_NAME;
++        assert_eq!(host_allocation_image_features(&advertised, ask), importable);
++        assert_eq!(asked.get(), 1);
++        // A device that cannot make the image at all is a "no" for that shape.
++        assert!(host_allocation_image_features(&advertised, || None).is_empty());
++    }
++
+     /// A negative rung carries no granularity. A non-zero alignment beside a
+     /// refusal is a number an import site could act on, and every one of those
+     /// rungs describes a device that would reject the import.
+diff --git a/crates/reims-vgpu/src/backend/vulkan/caps/linear_sampled.rs b/crates/reims-vgpu/src/backend/vulkan/caps/linear_sampled.rs
+index c29e636..53c50d9 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/caps/linear_sampled.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/caps/linear_sampled.rs
+@@ -162,38 +162,48 @@ impl LinearFormatVerdict {
+ /// Emitted on the `OFF` channel at device create, beside `vk_caps`, because it
+ /// is a fact about the host and not a loss. One line per boot.
+ ///
++/// The import half is asked through
++/// [`super::host_pointer::host_allocation_image_features`], so a device that
++/// does not advertise `VK_EXT_external_memory_host` reads `not_importable`
++/// without being handed a handle type it does not have; the line says which.
++///
+ /// # Safety
+ ///
+ /// `pd` must be a physical device belonging to `instance`.
+-pub unsafe fn report(instance: &ash::Instance, pd: vk::PhysicalDevice) {
++pub unsafe fn report(
++    instance: &ash::Instance,
++    pd: vk::PhysicalDevice,
++    has_extension: &dyn Fn(&std::ffi::CStr) -> bool,
++) {
+     let mut fields = String::new();
+     let mut possible = 0usize;
+     for (name, format) in PROBED {
+         let props = unsafe { instance.get_physical_device_format_properties(pd, *format) };
+         let mut verdict = LinearFormatVerdict::from_tiling(props.linear_tiling_features);
+ 
+-        let mut ext_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+-            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+-        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+-            .format(*format)
+-            .ty(vk::ImageType::TYPE_2D)
+-            .tiling(vk::ImageTiling::LINEAR)
+-            .usage(vk::ImageUsageFlags::SAMPLED)
+-            .push_next(&mut ext_info);
+-        let mut ext_props = vk::ExternalImageFormatProperties::default();
+-        let mut out = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
+-        // A device that cannot make this image at all answers `Err`, which is a
+-        // "no" for this format rather than an error for the boot.
+-        if unsafe { instance.get_physical_device_image_format_properties2(pd, &info, &mut out) }
+-            .is_ok()
+-        {
+-            let features = ext_props
+-                .external_memory_properties
+-                .external_memory_features;
+-            verdict.importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+-            verdict.dedicated_only =
+-                features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
+-        }
++        let features = super::host_pointer::host_allocation_image_features(has_extension, || {
++            let mut ext_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
++                .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
++            let info = vk::PhysicalDeviceImageFormatInfo2::default()
++                .format(*format)
++                .ty(vk::ImageType::TYPE_2D)
++                .tiling(vk::ImageTiling::LINEAR)
++                .usage(vk::ImageUsageFlags::SAMPLED)
++                .push_next(&mut ext_info);
++            let mut ext_props = vk::ExternalImageFormatProperties::default();
++            let mut out = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
++            // A device that cannot make this image at all answers `Err`, which is
++            // a "no" for this format rather than an error for the boot.
++            unsafe { instance.get_physical_device_image_format_properties2(pd, &info, &mut out) }
++                .ok()
++                .map(|()| {
++                    ext_props
++                        .external_memory_properties
++                        .external_memory_features
++                })
++        });
++        verdict.importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
++        verdict.dedicated_only = features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
+ 
+         if verdict.device_conditions_hold() {
+             possible += 1;
+@@ -201,10 +211,11 @@ pub unsafe fn report(instance: &ash::Instance, pd: vk::PhysicalDevice) {
+         fields.push_str(&format!(" {name}={}", verdict.slug()));
+     }
+     crate::observe::off(format!(
+-        "vk_linear_sampled alias_possible={possible}/{}{fields} (device conditions only — a window \
+-         also needs vkGetImageSubresourceLayout's rowPitch to equal the guest's declared pitch, \
+-         which is per-window and not asked here)",
+-        PROBED.len()
++        "vk_linear_sampled alias_possible={possible}/{}{fields} host_pointer_extension={} (device \
++         conditions only — a window also needs vkGetImageSubresourceLayout's rowPitch to equal the \
++         guest's declared pitch, which is per-window and not asked here)",
++        PROBED.len(),
++        has_extension(vk::EXT_EXTERNAL_MEMORY_HOST_NAME),
+     ));
+ }
+ 
+diff --git a/crates/reims-vgpu/src/backend/vulkan/caps/linear_target.rs b/crates/reims-vgpu/src/backend/vulkan/caps/linear_target.rs
+index 3e53f94..2abd4da 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/caps/linear_target.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/caps/linear_target.rs
+@@ -80,36 +80,45 @@ impl LinearTargetVerdict {
+ 
+ /// Report whether each resident colour format can be a linear imported target.
+ ///
++/// The import half is asked through
++/// [`super::host_pointer::host_allocation_image_features`], so a device without
++/// `VK_EXT_external_memory_host` reads `not_importable` unasked.
++///
+ /// # Safety
+ ///
+ /// `pd` must be a physical device belonging to `instance`.
+-pub(crate) unsafe fn report(instance: &ash::Instance, pd: vk::PhysicalDevice) {
++pub(crate) unsafe fn report(
++    instance: &ash::Instance,
++    pd: vk::PhysicalDevice,
++    has_extension: &dyn Fn(&std::ffi::CStr) -> bool,
++) {
+     let mut fields = String::new();
+     let mut possible = 0usize;
+     for (name, format) in PROBED {
+         let props = unsafe { instance.get_physical_device_format_properties(pd, *format) };
+         let mut verdict = LinearTargetVerdict::from_tiling(props.linear_tiling_features);
+ 
+-        let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+-            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+-        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+-            .format(*format)
+-            .ty(vk::ImageType::TYPE_2D)
+-            .tiling(vk::ImageTiling::LINEAR)
+-            .usage(BASE_USAGE)
+-            .push_next(&mut external);
+-        let mut external_props = vk::ExternalImageFormatProperties::default();
+-        let mut out = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+-        if unsafe { instance.get_physical_device_image_format_properties2(pd, &info, &mut out) }
+-            .is_ok()
+-        {
+-            let features = external_props
+-                .external_memory_properties
+-                .external_memory_features;
+-            verdict.importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+-            verdict.dedicated_only =
+-                features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
+-        }
++        let features = super::host_pointer::host_allocation_image_features(has_extension, || {
++            let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
++                .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
++            let info = vk::PhysicalDeviceImageFormatInfo2::default()
++                .format(*format)
++                .ty(vk::ImageType::TYPE_2D)
++                .tiling(vk::ImageTiling::LINEAR)
++                .usage(BASE_USAGE)
++                .push_next(&mut external);
++            let mut external_props = vk::ExternalImageFormatProperties::default();
++            let mut out = vk::ImageFormatProperties2::default().push_next(&mut external_props);
++            unsafe { instance.get_physical_device_image_format_properties2(pd, &info, &mut out) }
++                .ok()
++                .map(|()| {
++                    external_props
++                        .external_memory_properties
++                        .external_memory_features
++                })
++        });
++        verdict.importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
++        verdict.dedicated_only = features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
+ 
+         if verdict.device_conditions_hold() {
+             possible += 1;
+@@ -117,8 +126,9 @@ pub(crate) unsafe fn report(instance: &ash::Instance, pd: vk::PhysicalDevice) {
+         fields.push_str(&format!(" {name}={}", verdict.slug()));
+     }
+     crate::observe::off(format!(
+-        "vk_linear_target alias_possible={possible}/{}{fields} (device conditions only; each target also needs a stable alias, compatible memory type, and matching row pitch)",
+-        PROBED.len()
++        "vk_linear_target alias_possible={possible}/{}{fields} host_pointer_extension={} (device conditions only; each target also needs a stable alias, compatible memory type, and matching row pitch)",
++        PROBED.len(),
++        has_extension(vk::EXT_EXTERNAL_MEMORY_HOST_NAME),
+     ));
+ }
+ 
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/context.rs b/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
+index 421bfd9..1ee7c8c 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
+@@ -1396,12 +1396,12 @@ impl DeviceContext {
+         // decides if the sampled cache is memoizing a copy that has to exist.
+         // Reported and never branched on — see the module doc for why a positive
+         // answer here is necessary and not sufficient.
+-        crate::backend::vulkan::caps::linear_sampled::report(&instance, pd);
++        crate::backend::vulkan::caps::linear_sampled::report(&instance, pd, &has_device_extension);
+         // Whether a resident colour image can use imported guest storage as
+         // its backing. Like the sampled report, this is necessary but not
+         // sufficient: alias stability, memory requirements and row pitch are
+         // per-target questions.
+-        crate::backend::vulkan::caps::linear_target::report(&instance, pd);
++        crate::backend::vulkan::caps::linear_target::report(&instance, pd, &has_device_extension);
+         // Fine-grained capabilities that do change what a draw can express.
+         crate::observe::off(format!(
+             "vk_device_select name={device_name:?} type={:?} depth_stencil_format={:?} bgra_storage_composite={} compute_capable={} quirks_no_deferred_batching={} quirks_guest_pages_authoritative={}",

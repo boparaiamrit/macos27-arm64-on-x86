@@ -1,0 +1,19 @@
+# Verified recovery after one source transport failure
+
+The completed warm run ended after a source-layer read error, proxy fail-closed exit and guest `auearlyboot` panic. It is not a successful boot. Layer 49's recorded `ProtocolError` is from the exact installed urllib3 HTTP-response reader; frozen OCI framing/size/digest failures use `ConversionError`. The lower-level response error was not retained, so EOF/reset/malformed-response details remain unknown. No claim of a permanent network fix is made.
+
+Read-only source inspection confirmed that an incomplete layer never enters the verified layer cache. The backend has no permanent failure latch: another fresh read can perform a new full acquisition. The original backend remained alive, with all original guards and verification intact.
+
+Recovery gates completed before another guest launch:
+
+1. The stopped proxy's complete persistent cache was audited read-only, with a shared lock and no journal recovery. SQLite quick_check, exact source identity, all 5,600 dense slots, offsets/lengths/padding and source-bound SHA-256 passed. All 350 MiB of committed payload passed. Whole-cache file hashes and relevant metadata matched before/after; no bytes were copied or modified. Evidence: `cache-audit/REPORT.md` and `result.json`.
+2. One bounded direct source read repeated the failed 64-KiB range at RAW offset 2023686144. The original backend fetched layer 49 again and emitted `layer_verified` after complete size/compressed/uncompressed digest checks. The read returned after 131.144 seconds. No payload file was retained. SHA-256: `72c7501718298e0cbf19183fd75e7754376235f9b033e93f2b8e96a56671576a`.
+3. The exact stopped proxy identity/config/source pins were verified. Only its owned stale Unix socket in the new proxy-state volume was removed after confirming it was a singly linked socket and the container was exited. The same container was started with its unchanged configuration and preserved cache volumes. Original source service was not restarted.
+4. Recovered export readiness reported the same immutable source identity and 5,600 retained blocks. A focused read of the same range through the proxy returned in 0.041 seconds with the identical SHA-256; it committed the previously missing covering block. This is a focused recovery check, not a general prewarm or a boot-performance result.
+5. Proxy-backed CheckOnly `20261028T043507Z-km7n83rz` passed using the new verbatim readiness event `stream-ready-read-cache-recovered-live5.json`. It started no VM. All source pins, existing identity and overlay URI remain unchanged.
+
+The proxy retains ID `f640975cae8b2fdeead196cf9771367f179e9ffc3dcfbdbf9cd5f39055884d09`; its new Docker StartedAt is `2026-10-28T04:33:59.44839127Z`. Original source ID remains `b018c33c5b240dcda2bfea23ae2f8eeb3e673cd98fb8c1618cdf90e50d116d1d`. The sampler is still PID 104592, started 2026-10-28T03:22:14.7415671Z for four hours, beyond the next run's planned end.
+
+CONTROL AUX `5eeac62f996afe2a261512325ba064259005f408e8b6c20e25b2ce818ffd6420` and overlay `2942027dbdf45196e0daa6cf13295bc2ac7d8325aa27f437c9f0b573a02179f4` remain paired and preserved. No restore, rebase, guest/kernel patch, verification waiver or automatic retry policy was added. Cache implementation and original source implementation are unchanged. Any later read/guard/integrity failure must still be reported and stop safely.
+
+The next gate is one existing 7200-second boot profile through the recovered proxy, with the same guest state and no second debugger or runtime screenshot. The desktop remains unverified. Independent offline QMP frame-capture qualification may run concurrently in its own new directory, using only synthetic inputs and isolated test resources; it is not connected to this guest or imported by the active runner.

@@ -1,0 +1,416 @@
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
+@@ -803,6 +803,11 @@
+     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
+     #[cfg(feature = "host-window")]
+     pub swapchain: bool,
++    /// Test builds only: the messenger that hands the validation layer's error
++    /// reports to [`validation_capture`]. `None` when the loader offers no
++    /// `VK_EXT_debug_utils`.
++    #[cfg(test)]
++    pub validation_capture: Option<validation_capture::Messenger>,
+ }
+ 
+ /// Whether a display transaction completed inline on the raw-queue fallback or
+@@ -968,6 +973,14 @@
+                     instance_extensions.push(name.as_ptr());
+                 }
+             }
++        }
++        // Test builds only: receive the validation layer's reports in-process so
++        // a test can fail on one rather than leave a line for an outside reader.
++        #[cfg(test)]
++        let capture_validation = validation_capture::offered(&entry);
++        #[cfg(test)]
++        if capture_validation {
++            instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
+         }
+         let mut ici = vk::InstanceCreateInfo::default()
+             .application_info(&app)
+@@ -1451,6 +1464,12 @@
+             "vk_pipeline_cache_load bytes={initial_len} path={}",
+             pipeline_cache_path.display()
+         ));
++        #[cfg(test)]
++        let validation_capture = if capture_validation {
++            validation_capture::Messenger::install(&entry, &instance)
++        } else {
++            None
++        };
+         Ok(Self {
+             _entry: entry,
+             instance,
+@@ -1487,6 +1506,8 @@
+             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
+             #[cfg(feature = "host-window")]
+             swapchain,
++            #[cfg(test)]
++            validation_capture,
+         })
+     }
+ 
+@@ -1567,6 +1588,10 @@
+         self.device
+             .destroy_pipeline_cache(self.pipeline_cache, None);
+         self.device.destroy_device(None);
++        #[cfg(test)]
++        if let Some(capture) = self.validation_capture.take() {
++            capture.destroy();
++        }
+         self.instance.destroy_instance(None);
+     }
+ 
+@@ -2728,3 +2753,111 @@
+         std::fs::remove_dir_all(&dir).ok();
+     }
+ }
++
++/// Test instrument: the Khronos validation layer's error reports for this
++/// process, readable by the test that provoked them.
++///
++/// The layer prints to stdout whether or not anyone listens, and the
++/// qualification gate classifies those lines. A test that must *fail* on a
++/// report — a two-thread use of an externally synchronized fence, say — needs
++/// it in-process, so a test build asks for `VK_EXT_debug_utils` when the loader
++/// offers it and keeps every error the layer sends. The layer's own output is
++/// unchanged, and the callback returns `VK_FALSE`, so no call is skipped.
++#[cfg(test)]
++pub(crate) mod validation_capture {
++    use ash::vk;
++    use std::ffi::CStr;
++    use std::sync::Mutex;
++
++    /// One error-severity report.
++    #[derive(Clone, Debug)]
++    pub(crate) struct Report {
++        pub(crate) id: String,
++        pub(crate) message: String,
++        pub(crate) objects: Vec<u64>,
++    }
++
++    static ERRORS: Mutex<Vec<Report>> = Mutex::new(Vec::new());
++
++    /// Every error report captured in this process so far.
++    pub(crate) fn errors() -> Vec<Report> {
++        ERRORS.lock().unwrap_or_else(|e| e.into_inner()).clone()
++    }
++
++    /// Whether the loader offers `VK_EXT_debug_utils` to an instance.
++    pub(super) unsafe fn offered(entry: &ash::Entry) -> bool {
++        unsafe { entry.enumerate_instance_extension_properties(None) }.is_ok_and(|extensions| {
++            extensions.iter().any(|extension| {
++                let name = unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) };
++                name == ash::ext::debug_utils::NAME
++            })
++        })
++    }
++
++    pub(crate) struct Messenger {
++        loader: ash::ext::debug_utils::Instance,
++        messenger: vk::DebugUtilsMessengerEXT,
++    }
++
++    impl Messenger {
++        pub(super) unsafe fn install(entry: &ash::Entry, instance: &ash::Instance) -> Option<Self> {
++            let loader = ash::ext::debug_utils::Instance::new(entry, instance);
++            let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
++                .message_severity(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR)
++                .message_type(
++                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
++                        | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
++                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
++                )
++                .pfn_user_callback(Some(record));
++            let messenger = unsafe { loader.create_debug_utils_messenger(&info, None) }.ok()?;
++            Some(Self { loader, messenger })
++        }
++
++        pub(super) unsafe fn destroy(self) {
++            unsafe {
++                self.loader
++                    .destroy_debug_utils_messenger(self.messenger, None)
++            };
++        }
++    }
++
++    unsafe extern "system" fn record(
++        severity: vk::DebugUtilsMessageSeverityFlagsEXT,
++        _types: vk::DebugUtilsMessageTypeFlagsEXT,
++        data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
++        _user: *mut std::ffi::c_void,
++    ) -> vk::Bool32 {
++        if !severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) || data.is_null() {
++            return vk::FALSE;
++        }
++        // No panic may cross this boundary.
++        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            let data = unsafe { &*data };
++            let text = |p: *const std::ffi::c_char| {
++                if p.is_null() {
++                    String::new()
++                } else {
++                    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
++                }
++            };
++            let objects = if data.p_objects.is_null() {
++                Vec::new()
++            } else {
++                unsafe { std::slice::from_raw_parts(data.p_objects, data.object_count as usize) }
++                    .iter()
++                    .map(|object| object.object_handle)
++                    .collect()
++            };
++            ERRORS
++                .lock()
++                .unwrap_or_else(|e| e.into_inner())
++                .push(Report {
++                    id: text(data.p_message_id_name),
++                    message: text(data.p_message),
++                    objects,
++                });
++        }));
++        vk::FALSE
++    }
++}
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs
+@@ -7313,3 +7313,187 @@
+         assert_eq!(pools.attachment_snapshot_free.total, expected);
+     }
+ }
++
++/// A ring fence is the queue owner's until the owner is back from the
++/// `vkQueueSubmit` that took it.
++///
++/// A batch leaves the drain worker at the handoff, before that call has even
++/// started, and Vulkan makes the submitted fence externally synchronized for
++/// the call's whole length. A drain-side wait that starts first is what the R8
++/// qualification's `held-open-off` case caught: `vkQueueSubmit(): THREADING
++/// ERROR : object of type VkFence is simultaneously used in current thread …`,
++/// the owner submitting a fence the joined readback was already waiting on.
++///
++/// The owner is parked behind a hold so the order is not left to the
++/// scheduler: the handoff sits in its FIFO while the drain side reaches the
++/// fence, and a third thread releases the hold. The Khronos threading layer is
++/// the judge of a two-thread use, and a test build hears it in-process through
++/// `context::validation_capture`, so a ring that touches the fence early fails
++/// here on every run rather than only in the gate's reading of the log.
++#[cfg(test)]
++mod ring_fence_handoff_tests {
++    use super::*;
++    use crate::backend::vulkan::engine::context::validation_capture;
++    use crate::backend::vulkan::engine::queue_owner::OwnerHold;
++    use ash::vk::Handle;
++
++    /// Long enough that the drain side is certainly inside its wait first.
++    const RELEASE_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
++
++    /// Open a one-entry batch the way a deferred draw does: claim the slot,
++    /// begin it, append.
++    unsafe fn open_batch(
++        ctx: &DeviceContext,
++        pools: &mut ResourcePools,
++        counters: &EngineCounters,
++    ) -> vk::Fence {
++        let slot = unsafe { pools.begin_entry(ctx, counters) }.expect("ring slot");
++        unsafe {
++            pools.begin_slot_recording(
++                ctx,
++                slot.0,
++                gpu_span::Kind::Draw,
++                VkOp::ExecResetCb,
++                VkOp::ExecBeginCb,
++            )
++        }
++        .expect("recording batch");
++        let target = BatchTarget {
++            identity: TargetIdentity::Gva {
++                gva: 0xfe0000,
++                width: 4,
++                height: 4,
++                generation: 1,
++                format: vk::Format::R8G8B8A8_UNORM,
++            },
++            width: 4,
++            height: 4,
++            bgra: false,
++        };
++        unsafe { pools.batch_append(&ctx.device, slot, target, None, Vec::new(), counters) };
++        slot.1
++    }
++
++    fn release_later(hold: OwnerHold) -> std::thread::JoinHandle<()> {
++        std::thread::spawn(move || {
++            std::thread::sleep(RELEASE_AFTER);
++            drop(hold);
++        })
++    }
++
++    fn async_submits_returned(ctx: &DeviceContext) -> u64 {
++        ctx.queue_owner
++            .as_ref()
++            .expect("these tests are about the queue owner")
++            .stats()
++            .0
++    }
++
++    /// Where the validation layer is loaded its reports must be heard, or the
++    /// threading check would pass by not listening.
++    fn require_capture(ctx: &DeviceContext) {
++        let layer = std::fs::read_to_string("/proc/self/maps")
++            .is_ok_and(|maps| maps.contains("libVkLayer_khronos_validation"));
++        let capture = ctx.validation_capture.is_some();
++        eprintln!("RING_FENCE_VALIDATION_CAPTURE layer={layer} capture={capture}");
++        assert!(
++            !layer || capture,
++            "the validation layer is loaded but its reports are not captured"
++        );
++    }
++
++    /// The threading layer's reports that name `fence`.
++    fn threading_reports_on(fence: vk::Fence) -> Vec<String> {
++        validation_capture::errors()
++            .into_iter()
++            .filter(|report| {
++                report.id.starts_with("UNASSIGNED-Threading")
++                    && report.objects.contains(&fence.as_raw())
++            })
++            .map(|report| format!("{}: {}", report.id, report.message))
++            .collect()
++    }
++
++    /// The readback that joins an open batch hands it off and waits its fence
++    /// at once — `copy_image_level0_to_host_delivered`'s `batch_flush` then
++    /// `wait_entry_fence`. That wait may begin only once the owner is back.
++    #[test]
++    fn a_joined_readback_waits_its_batch_fence_only_after_the_owner_returns() {
++        crate::observe::redirect_logs_for_tests();
++        let mut ctx = match unsafe { DeviceContext::create() } {
++            Ok(c) => c,
++            Err(e) => {
++                eprintln!("SKIP ring fence handoff: no device ({e})");
++                return;
++            }
++        };
++        require_capture(&ctx);
++        let counters = EngineCounters::default();
++        let mut pools = ResourcePools::new();
++        unsafe { pools.ensure_init(&ctx, &counters) }.expect("ring");
++        let fence = unsafe { open_batch(&ctx, &mut pools, &counters) };
++
++        let hold = ctx.queue_owner.as_ref().expect("queue owner").hold();
++        unsafe { pools.batch_flush(&ctx, &counters) }.expect("handoff");
++        let release = release_later(hold);
++        unsafe { pools.wait_entry_fence(&ctx, &counters, fence) }
++            .expect("the batch completes once the owner submits it");
++        assert_eq!(
++            async_submits_returned(&ctx),
++            1,
++            "the batch fence was waited before the owner was back from vkQueueSubmit"
++        );
++        release.join().expect("release thread");
++        ctx.queue_wait_idle()
++            .expect("quiesce before owned destruction");
++        assert_eq!(
++            threading_reports_on(fence),
++            Vec::<String>::new(),
++            "the batch fence was used by two threads at once"
++        );
++
++        unsafe { pools.destroy_all(&ctx.device) };
++        unsafe { ctx.destroy() };
++    }
++
++    /// The quiesce every completion stamp runs hands the open batch off and
++    /// then waits and resets every pending fence — the batch's included.
++    #[test]
++    fn retiring_a_handed_off_batch_waits_for_the_owner_to_return() {
++        crate::observe::redirect_logs_for_tests();
++        let mut ctx = match unsafe { DeviceContext::create() } {
++            Ok(c) => c,
++            Err(e) => {
++                eprintln!("SKIP ring fence handoff: no device ({e})");
++                return;
++            }
++        };
++        require_capture(&ctx);
++        let counters = EngineCounters::default();
++        let mut pools = ResourcePools::new();
++        unsafe { pools.ensure_init(&ctx, &counters) }.expect("ring");
++        let fence = unsafe { open_batch(&ctx, &mut pools, &counters) };
++
++        let hold = ctx.queue_owner.as_ref().expect("queue owner").hold();
++        let release = release_later(hold);
++        unsafe { pools.retire_all(&ctx, &counters) }
++            .expect("the ring retires once the owner submits the batch");
++        assert_eq!(
++            async_submits_returned(&ctx),
++            1,
++            "a slot fence was waited before the owner was back from vkQueueSubmit"
++        );
++        assert_eq!(pools.in_flight, 0, "the handed-off batch retired");
++        release.join().expect("release thread");
++        ctx.queue_wait_idle()
++            .expect("quiesce before owned destruction");
++        assert_eq!(
++            threading_reports_on(fence),
++            Vec::<String>::new(),
++            "the batch fence was used, or reset, by two threads at once"
++        );
++
++        unsafe { pools.destroy_all(&ctx.device) };
++        unsafe { ctx.destroy() };
++    }
++}
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/queue_owner.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/queue_owner.rs
+@@ -69,6 +69,10 @@
+     Barrier {
+         reply: Reply,
+     },
++    /// Test seam: park the owner at this point of its FIFO until the matching
++    /// [`OwnerHold`] is dropped.
++    #[cfg(test)]
++    Hold(mpsc::Receiver<()>),
+     Stop,
+ }
+ 
+@@ -326,6 +330,27 @@
+         if let Some(join) = self.join.take() {
+             let _ = join.join();
+         }
++    }
++}
++
++/// Test seam returned by [`QueueOwner::hold`]: the owner thread stays parked
++/// where the hold entered its FIFO until this is dropped.
++#[cfg(test)]
++pub(crate) struct OwnerHold {
++    _release: mpsc::SyncSender<()>,
++}
++
++#[cfg(test)]
++impl QueueOwner {
++    /// Park the owner behind everything sent so far, so a test can decide when
++    /// a later submission reaches the driver instead of leaving it to the
++    /// scheduler.
++    pub(crate) fn hold(&self) -> OwnerHold {
++        let (release, parked) = mpsc::sync_channel(0);
++        self.sender
++            .send(Request::Hold(parked))
++            .expect("the queue owner is running");
++        OwnerHold { _release: release }
+     }
+ }
+ 
+@@ -418,6 +443,10 @@
+             Request::Barrier { reply } => {
+                 let _ = reply.send(Ok(QueueOutcome::Unit));
+             }
++            #[cfg(test)]
++            Request::Hold(parked) => {
++                let _ = parked.recv();
++            }
+             Request::Stop => return,
+         }
+     }

@@ -1,0 +1,11 @@
+Current parent-admitted scope, superseding only the application-identity requirement in historical PROTOCOL/HANDOFF.
+
+Latest rendering retained a clearly labeled Quit button but not the application title/body. Parent therefore defines a separate benign UI action, click_visible_quit, for the exact owned fresh VM with no user documents or credential entry. The operator must view the current retained PNG using view_image, identify a clearly labeled Quit button and select a pixel center inside it. The operator does not claim which application owns the fragment. No historical/inferred position, unlabeled shape, arbitrary pointer/key action, credential or setup consent is permitted. If no Quit label is visible, send zero input.
+
+The only production changes for this scope are the fixed action/attestation string and corresponding CLI flag. All nonce/attempt/current-running/fresh-identical-SHA/dimension/pixel-bounds/one-click guards remain. Press and explicit release remain distinct RPCs, release obligation is durable before press, and uncertain framing or unconfirmed release uses original owned cleanup without retry/reconnect. Parent also corrected the initial boot-debugger STOP handling before any captured-frame history; all later approval invalidation remains.
+
+New host command after actual perception approval:
+python -B ./test-output/arm-macos/full-system/mouse-guest/mouse_request.py --attempt EXACT click_visible_quit --id click-01 --nonce SESSION_NONCE --frame-sha256 CURRENT_SHA --width WIDTH --height HEIGHT --x PIXEL_X --y PIXEL_Y --attest-view-image-visible-quit
+Use --preview to inspect the exact bounded request without submission. The session nonce stays local; no second QMP socket is opened. capture/show retain their existing protocol. Current scope passed54 CPU-only tests including a demonstrated missing-feature RED; actual API qualification is separate and no real guest click has been sent.
+
+A click may dismiss the dialog/application or end its boot session; either is a bounded, reversible effect in this owned test guest. This is not approval to accept terms, submit forms, enter credentials, select unidentified controls or interact with another machine. Interaction is established only by actual before/after pixels and status, not positive RPC acknowledgement. Full desktop remains a distinct checkpoint.

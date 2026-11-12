@@ -1,0 +1,38 @@
+From fbda9c8b28351baab659dbd8e591914f44ee7fdb Mon Sep 17 00:00:00 2001
+From: Anees Iqbal <hello@aneesiqbal.ai>
+Date: Wed, 14 Oct 2026 23:28:34 +0300
+Subject: [PATCH] hw/vmapple: order virtio-net-pci's capabilities by address
+
+macOS 27's virtio PCI transport never starts a device whose capabilities
+are linked from high offsets to low (the previous commit), and
+virtio-net-pci links them by address only with x-ascending-capabilities
+on. Turn it on in the vmapple machine's defaults, so a VM's network card
+starts without the option on its command line.
+
+Measured with reims-ctl's command for each VM, unchanged: a macOS 27.0.1
+(26A434) guest's three virtio devices reach DRIVER_OK and it reaches its
+login window; a macOS 26 guest's do too, and it reaches its desktop with
+its menu bar and Dock.
+
+Not for upstream: written with an AI assistant, which QEMU's policy on
+AI-generated content (docs/devel/code-provenance.rst) declines.
+---
+ hw/vmapple/vmapple.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index da11b91132de5..2e055b01bdd83 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -766,6 +766,11 @@ static GlobalProperty vmapple_compat_defaults[] = {
+      * mapping in the XHCI controller works around the problem.
+      */
+     { TYPE_XHCI_PCI, "conditional-intr-mapping", "on" },
++    /*
++     * macOS 27's virtio PCI transport never starts a device whose
++     * capabilities are linked from high offsets to low.
++     */
++    { "virtio-net-pci-base", "x-ascending-capabilities", "on" },
+ };
+ 
+ static char *vmapple_get_tablet(Object *obj, Error **errp)

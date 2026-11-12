@@ -1,0 +1,823 @@
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
+@@ -1708,17 +1708,21 @@
+     /// Hand an ended draw batch to the ordered queue owner without waiting for
+     /// the host driver's `vkQueueSubmit` call.  A host that could not start the
+     /// owner retains the synchronous contract.
++    ///
++    /// `fence` stays the owner's until the returned handoff says that call is
++    /// back; see [`super::queue_owner::SubmitHandoff`].
+     pub(crate) unsafe fn submit_guest_work_async(
+         &self,
+         command_buffers: &[vk::CommandBuffer],
+         fence: vk::Fence,
+-    ) -> Result<(), vk::Result> {
++    ) -> Result<super::queue_owner::SubmitHandoff, vk::Result> {
+         let timeline = self
+             .stamp_completion
+             .as_ref()
+             .map(|completion| completion.reserve_submission());
+         let Some(owner) = self.queue_owner.as_ref() else {
+-            return unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) };
++            return unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) }
++                .map(|()| super::queue_owner::SubmitHandoff::RETURNED);
+         };
+         owner.submit_async(command_buffers, fence, timeline)
+     }
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
+@@ -1174,6 +1174,11 @@
+ struct CmdSlot {
+     cmd_buf: vk::CommandBuffer,
+     fence: vk::Fence,
++    /// Whether the queue owner is back from the `vkQueueSubmit` that took
++    /// `fence`. A batch leaves the drain worker before that call, and Vulkan
++    /// makes the submitted fence externally synchronized for its whole length,
++    /// so every wait, status query and reset of `fence` settles this first.
++    handoff: super::queue_owner::SubmitHandoff,
+     pending: Option<PendingGpuCleanup>,
+     /// Whether this slot's GPU timestamp pair has been written, and how far.
+     /// Read and cleared when the slot retires, which is the first moment the
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs
+@@ -16,6 +16,7 @@
+ //! declares `ResourcePools` and owns its fields, not a layer beneath it.
+ 
+ use super::*;
++use super::super::queue_owner::SubmitHandoff;
+ 
+ /// A readback slot lent out to be read where it lies.
+ ///
+@@ -706,6 +707,7 @@
+                     slots.push(CmdSlot {
+                         cmd_buf,
+                         fence,
++                        handoff: SubmitHandoff::RETURNED,
+                         pending: None,
+                         span: super::gpu_span::SlotSpan::Idle,
+                         readback_span_armed: false,
+@@ -1445,6 +1447,67 @@
+         }
+     }
+ 
++    /// Wait until the queue owner is back from the `vkQueueSubmit` that took
++    /// slot `index`'s fence, then refuse a submission that failed there.
++    ///
++    /// Vulkan makes that fence externally synchronized for the whole call. A
++    /// wait begun before it is the two-thread use the Khronos threading layer
++    /// reports from `vkQueueSubmit` as `UNASSIGNED-Threading-MultipleThreads-Write`,
++    /// and a reset after a driver that signals inside the call can land before
++    /// the call is over. Bounded by the deadline of the fence wait it precedes,
++    /// so a stalled owner surfaces as the same `FenceTimeout` a wedged fence
++    /// does instead of parking the drain worker.
++    fn await_slot_handoff(
++        &self,
++        ctx: &DeviceContext,
++        counters: &EngineCounters,
++        index: usize,
++        op: DeviceLostOp,
++    ) -> Result<(), DrawError> {
++        self.slots[index]
++            .handoff
++            .wait_returned(FENCE_TIMEOUT_NS)
++            .map_err(|e| {
++                if e == vk::Result::TIMEOUT {
++                    crate::observe::fail(format!(
++                        "vk_engine_submit_wedged slot={index} (the queue owner has not returned \
++                         from the vkQueueSubmit that took this slot's fence)"
++                    ));
++                }
++                Self::wait_error(counters, e, op)
++            })?;
++        // A call that failed submitted nothing, so the fence will never signal.
++        match ctx.queue_failure() {
++            Some(error) => Err(Self::wait_error(counters, error, op)),
++            None => Ok(()),
++        }
++    }
++
++    /// Whether slot `index`'s fence has signalled, without blocking.
++    ///
++    /// A fence the queue owner has not handed back is unsignalled for every
++    /// purpose here and is not asked: `vkGetFenceStatus` during the owner's
++    /// `vkQueueSubmit` is the same two-thread use as a wait.
++    unsafe fn slot_fence_signaled(
++        &self,
++        ctx: &DeviceContext,
++        counters: &EngineCounters,
++        index: usize,
++        op: DeviceLostOp,
++    ) -> Result<bool, DrawError> {
++        let slot = &self.slots[index];
++        if !slot
++            .handoff
++            .has_returned()
++            .map_err(|e| Self::wait_error(counters, e, op))?
++        {
++            return Ok(false);
++        }
++        ctx.device
++            .get_fence_status(slot.fence)
++            .map_err(|e| Self::wait_error(counters, e, op))
++    }
++
+     /// Retire one slot: wait its fence, reset it, and drain the cleanup it
+     /// owes. No-op for a slot with nothing pending.
+     unsafe fn retire_slot(
+@@ -1463,6 +1526,7 @@
+                 DeviceLostOp::PoolsWaitFencesRetire,
+             ));
+         }
++        self.await_slot_handoff(ctx, counters, index, DeviceLostOp::PoolsWaitFencesRetire)?;
+         let fence = self.slots[index].fence;
+         ctx.device
+             .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
+@@ -1497,6 +1561,7 @@
+         // queries are readable exactly now and never before.
+         unsafe { self.readback_span_read(ctx, index) };
+         let pending = self.slots[index].pending.take().expect("checked above");
++        self.slots[index].handoff = SubmitHandoff::RETURNED;
+         self.in_flight = self.in_flight.saturating_sub(1);
+         // Its fence has signalled, so this submission is no longer a candidate
+         // for a wedge. Paired with the `note_submit` in `finish_entry_async`.
+@@ -1521,10 +1586,7 @@
+             if self.slots[index].pending.is_none() {
+                 continue;
+             }
+-            let signaled = ctx
+-                .device
+-                .get_fence_status(self.slots[index].fence)
+-                .map_err(|e| Self::wait_error(counters, e, status_op))?;
++            let signaled = unsafe { self.slot_fence_signaled(ctx, counters, index, status_op)? };
+             if !signaled {
+                 break;
+             }
+@@ -1592,12 +1654,12 @@
+             // Count as a "block" only when the fence is genuinely unsignaled
+             // (the GPU still owns the slot); reclaiming a finished slot on
+             // advance is bookkeeping, not a stall.
+-            let still_running = !ctx
+-                .device
+-                .get_fence_status(self.slots[next].fence)
+-                .map_err(|e| {
+-                    Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
+-                })?;
++            let still_running = !self.slot_fence_signaled(
++                ctx,
++                counters,
++                next,
++                DeviceLostOp::PoolsFenceStatusBeginEntry,
++            )?;
+             self.retire_slot(ctx, counters, next)?;
+             if still_running {
+                 counters.ring_retire_blocks.fetch_add(1, Ordering::Relaxed);
+@@ -2072,7 +2134,7 @@
+             close_started.elapsed().as_micros() as u64,
+             Ordering::Relaxed,
+         );
+-        let submit = (|| -> Result<(), DrawError> {
++        let submit = (|| -> Result<SubmitHandoff, DrawError> {
+             let end_started = std::time::Instant::now();
+             let end_result = ctx.device.end_command_buffer(batch.cb);
+             counters
+@@ -2087,7 +2149,7 @@
+                 Ordering::Relaxed,
+             );
+             match result {
+-                Ok(()) => Ok(()),
++                Ok(handoff) => Ok(handoff),
+                 Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
+                     Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
+                         op: DeviceLostOp::PoolsSubmitBatch,
+@@ -2098,7 +2160,10 @@
+             }
+         })();
+         match submit {
+-            Ok(()) => {
++            Ok(handoff) => {
++                // The fence is the queue owner's until it is back from the
++                // driver call; every reader of it on this side settles this.
++                self.slots[slot].handoff = handoff;
+                 let finish_started = std::time::Instant::now();
+                 let sealed = self.seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
+                 self.finish_entry_async(&ctx.device, sealed);
+@@ -2149,6 +2214,12 @@
+                 error,
+                 DeviceLostOp::PoolsWaitFencesEntry,
+             ));
++        }
++        // An entry fence is one of this ring's, and a batch's may still be
++        // inside the queue owner's `vkQueueSubmit` — the readback that joined
++        // the batch reaches this wait microseconds after the handoff.
++        if let Some(index) = self.slots.iter().position(|slot| slot.fence == fence) {
++            self.await_slot_handoff(ctx, counters, index, DeviceLostOp::PoolsWaitFencesEntry)?;
+         }
+         ctx.device
+             .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
+@@ -6254,6 +6325,7 @@
+         CmdSlot {
+             cmd_buf: vk::CommandBuffer::null(),
+             fence: vk::Fence::null(),
++            handoff: SubmitHandoff::RETURNED,
+             pending: Some(PendingGpuCleanup {
+                 dsets: Vec::new(),
+                 scatter_dsets: Vec::new(),
+@@ -6275,6 +6347,7 @@
+         CmdSlot {
+             cmd_buf: vk::CommandBuffer::null(),
+             fence: vk::Fence::null(),
++            handoff: SubmitHandoff::RETURNED,
+             pending: None,
+             span: super::gpu_span::SlotSpan::Idle,
+             readback_span_armed: false,
+@@ -7313,3 +7386,145 @@
+         assert_eq!(pools.attachment_snapshot_free.total, expected);
+     }
+ }
++
++/// A ring fence is the queue owner's until the owner is back from the
++/// `vkQueueSubmit` that took it.
++///
++/// A batch leaves the drain worker at the handoff, before that call has even
++/// started, and Vulkan makes the submitted fence externally synchronized for
++/// the call's whole length. A drain-side wait that starts first is what the R8
++/// qualification's `held-open-off` case caught: `vkQueueSubmit(): THREADING
++/// ERROR : object of type VkFence is simultaneously used in current thread …`,
++/// the owner submitting a fence the joined readback was already waiting on.
++///
++/// The owner is parked behind a hold so the order is not left to the
++/// scheduler: the handoff sits in its FIFO while the drain side reaches the
++/// fence, and a third thread releases the hold. A ring that waits early is
++/// reported by the Khronos threading layer on every run; the assertions below
++/// are what holds on any host once it does not.
++#[cfg(test)]
++mod ring_fence_handoff_tests {
++    use super::*;
++    use crate::backend::vulkan::engine::queue_owner::OwnerHold;
++
++    /// Long enough that the drain side is certainly inside its wait first.
++    const RELEASE_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
++
++    /// Open a one-entry batch the way a deferred draw does: claim the slot,
++    /// begin it, append.
++    unsafe fn open_batch(
++        ctx: &DeviceContext,
++        pools: &mut ResourcePools,
++        counters: &EngineCounters,
++    ) -> vk::Fence {
++        let slot = unsafe { pools.begin_entry(ctx, counters) }.expect("ring slot");
++        unsafe {
++            pools.begin_slot_recording(
++                ctx,
++                slot.0,
++                gpu_span::Kind::Draw,
++                VkOp::ExecResetCb,
++                VkOp::ExecBeginCb,
++            )
++        }
++        .expect("recording batch");
++        let target = BatchTarget {
++            identity: TargetIdentity::Gva {
++                gva: 0xfe0000,
++                width: 4,
++                height: 4,
++                generation: 1,
++                format: vk::Format::R8G8B8A8_UNORM,
++            },
++            width: 4,
++            height: 4,
++            bgra: false,
++        };
++        unsafe { pools.batch_append(&ctx.device, slot, target, None, Vec::new(), counters) };
++        slot.1
++    }
++
++    fn release_later(hold: OwnerHold) -> std::thread::JoinHandle<()> {
++        std::thread::spawn(move || {
++            std::thread::sleep(RELEASE_AFTER);
++            drop(hold);
++        })
++    }
++
++    fn async_submits_returned(ctx: &DeviceContext) -> u64 {
++        ctx.queue_owner
++            .as_ref()
++            .expect("these tests are about the queue owner")
++            .stats()
++            .0
++    }
++
++    /// The readback that joins an open batch hands it off and waits its fence
++    /// at once — `copy_image_level0_to_host_delivered`'s `batch_flush` then
++    /// `wait_entry_fence`. That wait may begin only once the owner is back.
++    #[test]
++    fn a_joined_readback_waits_its_batch_fence_only_after_the_owner_returns() {
++        crate::observe::redirect_logs_for_tests();
++        let mut ctx = match unsafe { DeviceContext::create() } {
++            Ok(c) => c,
++            Err(e) => {
++                eprintln!("SKIP ring fence handoff: no device ({e})");
++                return;
++            }
++        };
++        let counters = EngineCounters::default();
++        let mut pools = ResourcePools::new();
++        unsafe { pools.ensure_init(&ctx, &counters) }.expect("ring");
++        let fence = unsafe { open_batch(&ctx, &mut pools, &counters) };
++
++        let hold = ctx.queue_owner.as_ref().expect("queue owner").hold();
++        unsafe { pools.batch_flush(&ctx, &counters) }.expect("handoff");
++        let release = release_later(hold);
++        unsafe { pools.wait_entry_fence(&ctx, &counters, fence) }
++            .expect("the batch completes once the owner submits it");
++        assert_eq!(
++            async_submits_returned(&ctx),
++            1,
++            "the batch fence was waited before the owner was back from vkQueueSubmit"
++        );
++        release.join().expect("release thread");
++
++        ctx.queue_wait_idle().expect("quiesce before owned destruction");
++        unsafe { pools.destroy_all(&ctx.device) };
++        unsafe { ctx.destroy() };
++    }
++
++    /// The quiesce every completion stamp runs hands the open batch off and
++    /// then waits and resets every pending fence — the batch's included.
++    #[test]
++    fn retiring_a_handed_off_batch_waits_for_the_owner_to_return() {
++        crate::observe::redirect_logs_for_tests();
++        let mut ctx = match unsafe { DeviceContext::create() } {
++            Ok(c) => c,
++            Err(e) => {
++                eprintln!("SKIP ring fence handoff: no device ({e})");
++                return;
++            }
++        };
++        let counters = EngineCounters::default();
++        let mut pools = ResourcePools::new();
++        unsafe { pools.ensure_init(&ctx, &counters) }.expect("ring");
++        unsafe { open_batch(&ctx, &mut pools, &counters) };
++
++        let hold = ctx.queue_owner.as_ref().expect("queue owner").hold();
++        let release = release_later(hold);
++        unsafe { pools.retire_all(&ctx, &counters) }
++            .expect("the ring retires once the owner submits the batch");
++        assert_eq!(
++            async_submits_returned(&ctx),
++            1,
++            "a slot fence was waited before the owner was back from vkQueueSubmit"
++        );
++        assert_eq!(pools.in_flight, 0, "the handed-off batch retired");
++        release.join().expect("release thread");
++
++        ctx.queue_wait_idle().expect("quiesce before owned destruction");
++        unsafe { pools.destroy_all(&ctx.device) };
++        unsafe { ctx.destroy() };
++    }
++}
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/queue_owner.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/queue_owner.rs
+@@ -6,10 +6,18 @@
+ //! draw batch handed off before it.  Sending all queue operations through this
+ //! FIFO preserves both properties while allowing an ended draw batch to leave
+ //! the drain worker before the host driver returns from `vkQueueSubmit`.
++//!
++//! That early return lends the batch's fence to this thread. Vulkan makes the
++//! `fence` of `vkQueueSubmit` externally synchronized for the whole call, so no
++//! other thread may wait on, query, reset or destroy it until the call has
++//! returned — and the drain worker reaches that fence first whenever it
++//! outruns this thread. [`SubmitHandoff`] is how the fence comes back: the
++//! asynchronous submit returns one, and this thread settles it after the
++//! driver call, its failure latch and its statistics.
+ 
+ use ash::vk;
+ use std::sync::atomic::{AtomicU64, Ordering};
+-use std::sync::{mpsc, Arc, Mutex};
++use std::sync::{mpsc, Arc, Condvar, Mutex};
+ 
+ use super::stamp_completion::SubmissionNote;
+ 
+@@ -29,7 +37,135 @@
+     fence: vk::Fence,
+     timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
+     async_queued_at: Option<std::time::Instant>,
+-}
++    /// Present only on an asynchronous submit, whose caller kept the other
++    /// half. A synchronous caller learns the same thing from its reply.
++    returned: Option<ReturnSignal>,
++}
++
++/// Where one asynchronous submission's `vkQueueSubmit` stands on the host.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum HostCall {
++    /// Waiting in this owner's FIFO, or inside the driver call.
++    Outstanding,
++    /// Back from the call, successful or not, with any failure it returned
++    /// already latched.
++    Returned,
++    /// Dropped without reaching the driver: the owner is gone, so the fence
++    /// will never be submitted.
++    Abandoned,
++}
++
++impl HostCall {
++    fn result(self) -> Result<(), vk::Result> {
++        match self {
++            Self::Outstanding => Err(vk::Result::TIMEOUT),
++            Self::Returned => Ok(()),
++            Self::Abandoned => Err(vk::Result::ERROR_DEVICE_LOST),
++        }
++    }
++}
++
++#[derive(Debug)]
++struct ReturnLatch {
++    state: Mutex<HostCall>,
++    changed: Condvar,
++}
++
++impl ReturnLatch {
++    /// Leave `Outstanding` exactly once; a later settle is a no-op.
++    fn settle(&self, to: HostCall) {
++        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
++        if *state == HostCall::Outstanding {
++            *state = to;
++            self.changed.notify_all();
++        }
++    }
++}
++
++/// The owner thread's half of a [`SubmitHandoff`].
++///
++/// Dropping it unsettled — the request never sent, or discarded with a dead
++/// owner thread — abandons the submission, so the fence's owner learns that
++/// immediately instead of waiting out a deadline for a call that will never
++/// happen.
++#[derive(Debug)]
++struct ReturnSignal(Arc<ReturnLatch>);
++
++impl ReturnSignal {
++    fn returned(self) {
++        self.0.settle(HostCall::Returned);
++    }
++}
++
++impl Drop for ReturnSignal {
++    fn drop(&mut self) {
++        self.0.settle(HostCall::Abandoned);
++    }
++}
++
++/// Whether the `vkQueueSubmit` that took one fence has returned on the host.
++///
++/// Until it has, the fence belongs to that call: the caller may not wait on,
++/// query, reset or destroy it. Completion is still the fence's own answer;
++/// this says only when the fence may be asked.
++#[derive(Debug)]
++pub(crate) struct SubmitHandoff(Option<Arc<ReturnLatch>>);
++
++impl SubmitHandoff {
++    /// A submission whose `vkQueueSubmit` already returned on the calling
++    /// thread: the synchronous rails, and a slot that has retired.
++    pub(crate) const RETURNED: Self = Self(None);
++
++    fn outstanding() -> (Self, ReturnSignal) {
++        let latch = Arc::new(ReturnLatch {
++            state: Mutex::new(HostCall::Outstanding),
++            changed: Condvar::new(),
++        });
++        (Self(Some(Arc::clone(&latch))), ReturnSignal(latch))
++    }
++
++    /// Whether the fence may be touched now. Never blocks; a submission the
++    /// owner abandoned answers `ERROR_DEVICE_LOST`.
++    pub(crate) fn has_returned(&self) -> Result<bool, vk::Result> {
++        let Some(latch) = self.0.as_ref() else {
++            return Ok(true);
++        };
++        match *latch.state.lock().unwrap_or_else(|e| e.into_inner()) {
++            HostCall::Outstanding => Ok(false),
++            settled => settled.result().map(|()| true),
++        }
++    }
++
++    /// Wait until the call has returned. `TIMEOUT` means the owner is still
++    /// inside it (or still behind earlier work) at the deadline; the caller
++    /// reports that the way it reports a fence that outlived the same deadline.
++    pub(crate) fn wait_returned(&self, timeout_ns: u64) -> Result<(), vk::Result> {
++        let Some(latch) = self.0.as_ref() else {
++            return Ok(());
++        };
++        let state = latch.state.lock().unwrap_or_else(|e| e.into_inner());
++        let (state, _) = latch
++            .changed
++            .wait_timeout_while(state, std::time::Duration::from_nanos(timeout_ns), |state| {
++                *state == HostCall::Outstanding
++            })
++            .unwrap_or_else(|e| e.into_inner());
++        state.result()
++    }
++}
++
++/// Two handoffs are equal when they are the same submission's.
++impl PartialEq for SubmitHandoff {
++    fn eq(&self, other: &Self) -> bool {
++        match (&self.0, &other.0) {
++            (None, None) => true,
++            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
++            _ => false,
++        }
++    }
++}
++
++impl Eq for SubmitHandoff {}
+ 
+ /// Completion of one ordered submit-plus-present transaction.
+ ///
+@@ -69,6 +205,10 @@
+     Barrier {
+         reply: Reply,
+     },
++    /// Test seam: park the owner at this point of its FIFO until the matching
++    /// [`OwnerHold`] is dropped.
++    #[cfg(test)]
++    Hold(mpsc::Receiver<()>),
+     Stop,
+ }
+ 
+@@ -180,6 +320,7 @@
+             fence,
+             timeline,
+             async_queued_at: None,
++            returned: None,
+         };
+         self.send_sync(|reply| Request::Submit {
+             submit,
+@@ -188,18 +329,23 @@
+         .map(|_| ())
+     }
+ 
++    /// Hand one submission to the owner and return before its driver call.
++    ///
++    /// The returned [`SubmitHandoff`] lends `fence` to the owner until that
++    /// call is back; see the module documentation.
+     pub(crate) fn submit_async(
+         &self,
+         command_buffers: &[vk::CommandBuffer],
+         fence: vk::Fence,
+         timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
+-    ) -> Result<(), vk::Result> {
++    ) -> Result<SubmitHandoff, vk::Result> {
+         if let Some(result) = self.failure.get() {
+             return Err(result);
+         }
+         let queued_point = timeline
+             .as_ref()
+             .map(|(_, value, note)| (*value, note.clone()));
++        let (handoff, returned) = SubmitHandoff::outstanding();
+         self.sender
+             .send(Request::Submit {
+                 submit: OwnedSubmit {
+@@ -210,6 +356,7 @@
+                     fence,
+                     timeline,
+                     async_queued_at: Some(std::time::Instant::now()),
++                    returned: Some(returned),
+                 },
+                 reply: None,
+             })
+@@ -217,7 +364,7 @@
+         if let Some((value, note)) = queued_point {
+             note.queued(value);
+         }
+-        Ok(())
++        Ok(handoff)
+     }
+ 
+     pub(crate) fn submit_sync_ordered(
+@@ -236,6 +383,7 @@
+             fence,
+             timeline: None,
+             async_queued_at: None,
++            returned: None,
+         };
+         self.send_sync(|reply| Request::Submit {
+             submit,
+@@ -267,6 +415,7 @@
+             fence: transaction.fence,
+             timeline: None,
+             async_queued_at: None,
++            returned: None,
+         };
+         let (reply, receiver) = mpsc::sync_channel(1);
+         self.sender
+@@ -329,6 +478,52 @@
+     }
+ }
+ 
++/// Test seam returned by [`QueueOwner::hold`]: the owner thread stays parked
++/// where the hold entered its FIFO until this is dropped.
++#[cfg(test)]
++pub(crate) struct OwnerHold {
++    _release: mpsc::SyncSender<()>,
++}
++
++#[cfg(test)]
++impl QueueOwner {
++    /// Park the owner behind everything sent so far, so a test can decide when
++    /// a later submission reaches the driver instead of leaving it to the
++    /// scheduler.
++    pub(crate) fn hold(&self) -> OwnerHold {
++        let (release, parked) = mpsc::sync_channel(0);
++        self.sender
++            .send(Request::Hold(parked))
++            .expect("the queue owner is running");
++        OwnerHold { _release: release }
++    }
++}
++
++/// Publish one submission's outcome in the order its waiters depend on: latch
++/// an asynchronous failure or answer the synchronous caller, and only then give
++/// the fence back. A thread that sees the fence returned therefore also sees
++/// whether the call failed, which is when the fence will never signal.
++fn finish_submit(
++    failure: &FailureLatch,
++    result: Result<(), vk::Result>,
++    reply: Option<Reply>,
++    returned: Option<ReturnSignal>,
++) {
++    match reply {
++        None => {
++            if let Err(result) = result {
++                failure.set(result);
++            }
++        }
++        Some(reply) => {
++            let _ = reply.send(result.map(|_| QueueOutcome::Unit));
++        }
++    }
++    if let Some(returned) = returned {
++        returned.returned();
++    }
++}
++
+ fn run(
+     device: &ash::Device,
+     queue: vk::Queue,
+@@ -338,7 +533,10 @@
+ ) {
+     while let Ok(request) = receiver.recv() {
+         match request {
+-            Request::Submit { submit, reply } => {
++            Request::Submit { mut submit, reply } => {
++                // Settled by `finish_submit`, after the call below and even
++                // when a latched failure skips it.
++                let returned = submit.returned.take();
+                 let async_queued_at = submit.async_queued_at;
+                 let driver_started = std::time::Instant::now();
+                 let result = failure
+@@ -355,14 +553,7 @@
+                         Ordering::Relaxed,
+                     );
+                 }
+-                if reply.is_none() {
+-                    if let Err(result) = result {
+-                        failure.set(result);
+-                    }
+-                }
+-                if let Some(reply) = reply {
+-                    let _ = reply.send(result.map(|_| QueueOutcome::Unit));
+-                }
++                finish_submit(failure, result, reply, returned);
+             }
+             Request::PresentTransaction {
+                 submit,
+@@ -418,6 +609,10 @@
+             Request::Barrier { reply } => {
+                 let _ = reply.send(Ok(QueueOutcome::Unit));
+             }
++            #[cfg(test)]
++            Request::Hold(parked) => {
++                let _ = parked.recv();
++            }
+             Request::Stop => return,
+         }
+     }
+@@ -607,4 +802,115 @@
+         assert_eq!(latch.get(), Some(vk::Result::ERROR_DEVICE_LOST));
+         assert!(super::super::device_lost::take_device_lost_seen());
+     }
+-}
++
++    /// The fence of an asynchronous submit is not the caller's while the
++    /// submission sits in the FIFO, and comes back only through the owner.
++    ///
++    /// This is the window the R8 `held-open-off` case fell into: the readback
++    /// that joined the batch waited the batch fence while this owner was still
++    /// inside `vkQueueSubmit` with it, and the Khronos threading layer reported
++    /// the two-thread use on every run.
++    #[test]
++    fn an_async_fence_is_lent_to_the_owner_until_its_submit_returns() {
++        let (sender, receiver) = mpsc::channel();
++        let owner = owner_with_sender(sender);
++
++        let handoff = owner
++            .submit_async(&[vk::CommandBuffer::from_raw(1)], vk::Fence::from_raw(2), None)
++            .expect("owner accepted submission");
++        assert_eq!(
++            handoff.has_returned(),
++            Ok(false),
++            "a fence still in the owner's FIFO may not be waited, queried or reset"
++        );
++        assert_eq!(handoff.wait_returned(1_000_000), Err(vk::Result::TIMEOUT));
++
++        let Request::Submit { mut submit, reply } =
++            receiver.try_recv().expect("submission remains in host FIFO")
++        else {
++            panic!("async handoff queued a non-submit request");
++        };
++        let returned = submit
++            .returned
++            .take()
++            .expect("an asynchronous submit carries the owner's half of its handoff");
++        finish_submit(&FailureLatch::default(), Ok(()), reply, Some(returned));
++
++        assert_eq!(handoff.has_returned(), Ok(true));
++        assert_eq!(handoff.wait_returned(0), Ok(()));
++    }
++
++    /// A submission that failed in the driver submitted nothing, so its fence
++    /// never signals. The caller must therefore see the failure no later than
++    /// it sees the fence handed back, or it waits a fence nothing will signal.
++    #[test]
++    fn an_async_failure_is_latched_before_its_fence_is_handed_back() {
++        let _ = super::super::device_lost::take_device_lost_seen();
++        let latch = FailureLatch::default();
++        let (handoff, returned) = SubmitHandoff::outstanding();
++
++        finish_submit(
++            &latch,
++            Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
++            None,
++            Some(returned),
++        );
++
++        assert_eq!(handoff.wait_returned(0), Ok(()));
++        assert_eq!(latch.get(), Some(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
++        assert!(super::super::device_lost::take_device_lost_seen());
++    }
++
++    /// The fence's owner may be another thread, blocked until the call returns.
++    #[test]
++    fn a_waiter_on_another_thread_wakes_when_the_submit_returns() {
++        let (handoff, returned) = SubmitHandoff::outstanding();
++        let waiter = std::thread::spawn(move || handoff.wait_returned(5_000_000_000));
++
++        std::thread::sleep(std::time::Duration::from_millis(20));
++        returned.returned();
++
++        assert_eq!(waiter.join().expect("waiter"), Ok(()));
++    }
++
++    /// A stalled owner bounds the wait instead of hanging the drain worker; the
++    /// caller reports the deadline like a fence that outlived it.
++    #[test]
++    fn a_stalled_owner_bounds_the_handoff_wait() {
++        let (handoff, _owner_still_inside_the_call) = SubmitHandoff::outstanding();
++        let started = std::time::Instant::now();
++
++        assert_eq!(handoff.wait_returned(20_000_000), Err(vk::Result::TIMEOUT));
++        assert!(started.elapsed() >= std::time::Duration::from_millis(20));
++        assert_eq!(handoff.has_returned(), Ok(false));
++    }
++
++    /// A submission dropped before the driver call — the owner thread gone — is
++    /// lost at once rather than waited to the deadline.
++    #[test]
++    fn a_submission_the_owner_never_reached_is_lost_not_outstanding() {
++        let (sender, receiver) = mpsc::channel();
++        let owner = owner_with_sender(sender);
++        let handoff = owner
++            .submit_async(&[vk::CommandBuffer::from_raw(1)], vk::Fence::from_raw(2), None)
++            .expect("owner accepted submission");
++
++        // The owner thread and its FIFO go away with this submission unrun.
++        drop(receiver);
++        drop(owner);
++
++        assert_eq!(handoff.has_returned(), Err(vk::Result::ERROR_DEVICE_LOST));
++        assert_eq!(
++            handoff.wait_returned(5_000_000_000),
++            Err(vk::Result::ERROR_DEVICE_LOST)
++        );
++    }
++
++    /// The synchronous rails return from `vkQueueSubmit` before handing back,
++    /// so they have nothing outstanding.
++    #[test]
++    fn a_synchronous_submit_has_nothing_outstanding() {
++        assert_eq!(SubmitHandoff::RETURNED.has_returned(), Ok(true));
++        assert_eq!(SubmitHandoff::RETURNED.wait_returned(0), Ok(()));
++    }
++}

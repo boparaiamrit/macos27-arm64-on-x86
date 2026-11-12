@@ -1,0 +1,710 @@
+--- baseline/crates/reims-vgpu-core/src/pass.rs
++++ qualified/crates/reims-vgpu-core/src/pass.rs
+@@ -698,3 +698,52 @@
+         assert!(a.subresource().overlaps(b.subresource()));
+     }
+ }
++
++
++/// A reflected framebuffer-fetch ordinal, bounded by the decoded pass shape.
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
++pub struct ColorInputIndex(u8);
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct ColorInputIndexError(pub u32);
++impl ColorInputIndex {
++    pub fn parse(raw: u32) -> Result<Self, ColorInputIndexError> {
++        if raw < COLOR_ATTACHMENTS as u32 { Ok(Self(raw as u8)) }
++        else { Err(ColorInputIndexError(raw)) }
++    }
++    pub const fn get(self) -> usize { self.0 as usize }
++}
++/// The semantic input slots. Holes retain their guest ordinal; no packed renumbering.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
++pub struct ColorInputs(u8);
++const _: () = assert!(COLOR_ATTACHMENTS == u8::BITS as usize);
++impl ColorInputs {
++    pub fn parse(indices: impl IntoIterator<Item=u32>) -> Result<Self, ColorInputIndexError> {
++        let mut result = Self::default();
++        for raw in indices { let index=ColorInputIndex::parse(raw)?; result.0 |= 1 << index.0; }
++        Ok(result)
++    }
++    pub const fn is_empty(self) -> bool { self.0 == 0 }
++    pub const fn contains(self, index: usize) -> bool {
++        index < COLOR_ATTACHMENTS && self.0 & (1u8 << index) != 0
++    }
++    pub const fn count(self) -> u32 { self.0.count_ones() }
++    pub fn span(self) -> usize { (u8::BITS - self.0.leading_zeros()) as usize }
++    pub fn iter(self) -> impl Iterator<Item=ColorInputIndex> {
++        (0..COLOR_ATTACHMENTS).filter(move |&i| self.contains(i)).map(|i| ColorInputIndex(i as u8))
++    }
++}
++#[cfg(test)]
++mod mrt_order_inputs_tests {
++    use super::*;
++    #[test]
++    fn mrt_order_sets_preserve_sparse_ordinals_and_reject_overflow() {
++        for indices in [vec![],vec![0],vec![1],vec![0,1],vec![7],vec![1,7]] {
++            let set=ColorInputs::parse(indices.clone()).unwrap();
++            assert_eq!(set.iter().map(|i| i.get() as u32).collect::<Vec<_>>(),indices);
++            assert_eq!(set.count() as usize,indices.len());
++            assert_eq!(set.span(),indices.last().map_or(0,|i| *i as usize+1));
++        }
++        for index in [8,9,255,u32::MAX] { assert_eq!(ColorInputs::parse([index]),Err(ColorInputIndexError(index))); }
++        assert_eq!(ColorInputs::parse([1,1]).unwrap().count(),1);
++    }
++}
+--- baseline/crates/reims-vgpu/src/backend/vulkan/engine/color_input.rs
++++ qualified/crates/reims-vgpu/src/backend/vulkan/engine/color_input.rs
+@@ -0,0 +1,97 @@
++//! Admitted ordered framebuffer inputs. No feature widening or attachment inference.
++use ash::vk;
++use super::types::DrawError;
++use super::reason::DrawReason;
++use crate::backend::vulkan::caps::device_features::DeviceFeatures;
++pub use reims_vgpu_core::pass::{ColorInputs, ColorInputIndex, ColorInputIndexError, COLOR_ATTACHMENTS};
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum ColorInputDecline {
++    InvalidIndex(ColorInputIndexError),
++    OrderedAccessUnavailable,
++    PhysicalCapacity { requested: usize, limit: u32 },
++    DescriptorCapacity { requested: u32, limit: u32 },
++    MissingAttachment { index: usize },
++}
++impl crate::observe::Decline for ColorInputDecline {
++    fn slug(&self) -> &'static str {
++        match self {
++            Self::InvalidIndex(_) => "color_input_index_out_of_range",
++            Self::OrderedAccessUnavailable => "color_input_ordered_access_unavailable",
++            Self::PhysicalCapacity {..} => "color_input_attachment_capacity",
++            Self::DescriptorCapacity {..} => "color_input_descriptor_capacity",
++            Self::MissingAttachment {..} => "color_input_attachment_missing",
++        }
++    }
++    fn fields(&self) -> Vec<(&'static str,String)> {
++        match self {
++            Self::InvalidIndex(e)=>vec![("index",e.0.to_string())],
++            Self::OrderedAccessUnavailable=>vec![],
++            Self::PhysicalCapacity{requested,limit}=>vec![("requested",requested.to_string()),("limit",limit.to_string())],
++            Self::DescriptorCapacity{requested,limit}=>vec![("requested",requested.to_string()),("limit",limit.to_string())],
++            Self::MissingAttachment{index}=>vec![("index",index.to_string())],
++        }
++    }
++}
++pub(super) fn refusal(r: ColorInputDecline) -> DrawError { DrawError::Unsupported(DrawReason::ColorInput(r)) }
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
++pub(crate) struct OrderedColorInputs(ColorInputs);
++impl OrderedColorInputs {
++    pub(crate) fn admit(inputs: ColorInputs, caps: &DeviceFeatures, materialized: usize) -> Result<Self,DrawError> {
++        if inputs.is_empty() { return Ok(Self::default()); }
++        if !caps.ordered_color_attachment_access { return Err(refusal(ColorInputDecline::OrderedAccessUnavailable)); }
++        if materialized > COLOR_ATTACHMENTS || materialized > caps.max_color_attachments as usize {
++            return Err(refusal(ColorInputDecline::PhysicalCapacity{requested:materialized,limit:caps.max_color_attachments}));
++        }
++        if inputs.count() > caps.input_attachment_descriptor_limit {
++            return Err(refusal(ColorInputDecline::DescriptorCapacity{requested:inputs.count(),limit:caps.input_attachment_descriptor_limit}));
++        }
++        for index in inputs.iter() {
++            if index.get() >= materialized { return Err(refusal(ColorInputDecline::MissingAttachment{index:index.get()})); }
++        }
++        Ok(Self(inputs))
++    }
++    pub(crate) fn is_empty(self) -> bool { self.0.is_empty() }
++    pub(crate) fn contains(self,index:usize) -> bool { self.0.contains(index) }
++    pub(crate) fn iter(self) -> impl Iterator<Item=ColorInputIndex> { self.0.iter() }
++    pub(crate) fn span(self) -> usize { self.0.span() }
++    pub(crate) fn subpass_flags(self) -> vk::SubpassDescriptionFlags {
++        if self.is_empty() { vk::SubpassDescriptionFlags::empty() }
++        else { vk::SubpassDescriptionFlags::RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_EXT }
++    }
++    pub(crate) fn blend_flags(self) -> vk::PipelineColorBlendStateCreateFlags {
++        if self.is_empty() { vk::PipelineColorBlendStateCreateFlags::empty() }
++        else { vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT }
++    }
++    #[cfg(test)]
++    pub(crate) fn fixture(indices: &[u32]) -> Self {
++        Self::admit(ColorInputs::parse(indices.iter().copied()).unwrap(), &DeviceFeatures {
++            ordered_color_attachment_access:true,max_color_attachments:8,input_attachment_descriptor_limit:8,..Default::default()
++        },COLOR_ATTACHMENTS).unwrap()
++    }
++}
++#[cfg(test)]
++mod mrt_order_plan_tests {
++    use super::*;
++    #[test]
++    fn mrt_order_gates_every_nonempty_input_and_preserves_empty_hosts() {
++        let off=DeviceFeatures::default();
++        assert!(OrderedColorInputs::admit(ColorInputs::default(),&off,100).is_ok());
++        for i in [0,1,7] {
++            assert_eq!(OrderedColorInputs::admit(ColorInputs::parse([i]).unwrap(),&off,8), Err(refusal(ColorInputDecline::OrderedAccessUnavailable)));
++        }
++        let on=DeviceFeatures{ordered_color_attachment_access:true,max_color_attachments:8,input_attachment_descriptor_limit:1,..Default::default()};
++        assert!(OrderedColorInputs::admit(ColorInputs::parse([7]).unwrap(),&on,8).is_ok());
++        assert!(matches!(OrderedColorInputs::admit(ColorInputs::parse([1]).unwrap(),&on,1),Err(DrawError::Unsupported(DrawReason::ColorInput(ColorInputDecline::MissingAttachment{index:1})))));
++        assert!(OrderedColorInputs::admit(ColorInputs::parse([0,1]).unwrap(),&on,2).is_err());
++        let low=DeviceFeatures{max_color_attachments:1,..on};
++        assert!(OrderedColorInputs::admit(ColorInputs::parse([1]).unwrap(),&low,2).is_err());
++    }
++    #[test]
++    fn mrt_order_flags_are_only_on_admitted_nonempty_plans() {
++        for indices in [vec![],vec![0],vec![1],vec![0,1],vec![7]] {
++            let p=OrderedColorInputs::fixture(&indices);
++            assert_eq!(p.subpass_flags().is_empty(),indices.is_empty());
++            assert_eq!(p.blend_flags().is_empty(),indices.is_empty());
++        }
++    }
++}
+--- baseline/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
++++ qualified/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+@@ -9,6 +9,8 @@
+ 
+ mod buffer_slab;
+ mod caches;
++pub mod color_input;
++pub use reims_vgpu_core::pass::ColorInputs;
+ mod compute_execution;
+ mod compute_validation;
+ mod context;
+--- baseline/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
++++ qualified/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+@@ -661,13 +661,9 @@
+     /// buffer, byte-identical to the pre-depth 2D path. Set only for a draw that
+     /// bound a non-trivial `MTLDepthStencilState` (see `runtime::draw`).
+     pub depth: Option<DepthState>,
+-    /// Fragment shader reads its destination pixel (Metal framebuffer fetch:
+-    /// an `air.render_target` INPUT param, translated as a `SubpassData` image
+-    /// at [`COLOR_INPUT_BINDING`]). The engine then references attachment 0 as
+-    /// a subpass input (GENERAL layout, BY_REGION self-dependency) and writes
+-    /// an INPUT_ATTACHMENT descriptor pointing at the color target's view.
+-    /// `false` (default) keeps the pass byte-identical to the pre-fetch engine.
+-    pub color_input: bool,
++    /// Reflected guest framebuffer-input slots. Parsed once, admitted against the
++    /// actual device before execution; sparse ordinals keep their attachment index.
++    pub color_input: reims_vgpu_core::pass::ColorInputs,
+     /// The preceding engine request belongs to this draw's Metal render
+     /// encoder. Used only when its Vulkan pass is still open and identical.
+     pub continues_render_pass: bool,
+@@ -784,15 +780,8 @@
+     req.viewports.len().max(req.scissors.len()).max(1)
+ }
+ 
+-/// Descriptor binding of the attachment-0 framebuffer-fetch input attachment.
+-///
+-/// This is the *device's* ColorInput band base, not the translator's: the band
+-/// moved up when the texture band was widened to Metal's 128 entries
+-/// (`runtime::spirv_bind::widen_sampled_bands` rewrites `dest_N` from the
+-/// translator's `96+N` to `192+N`). Only `dest_0` is supported. Kept equal to
+-/// `runtime::spirv_bind::COLOR_INPUT_BINDING_BASE` by a unit test there, because
+-/// the two constants live on opposite sides of the runtime/engine layering.
+-/// Both fragment relocations preserve it.
++/// Engine descriptor band base. Input slot N binds at 192+N, matching the
++/// runtime default translation configuration and engine relocation contract.
+ pub const COLOR_INPUT_BINDING: u32 = 192;
+ 
+ /// One MRT color attachment beyond the primary (slot 0). Persisted as its own
+@@ -2749,7 +2738,7 @@
+         assert!(draw.target_identity.is_none());
+         assert!(draw.depth.is_none());
+         assert!(!draw.skip_readback);
+-        assert!(!draw.color_input);
++        assert!(draw.color_input.is_empty());
+ 
+         let compute = ComputeRequest::default();
+         assert_eq!(compute.dispatch, ComputeDispatch::Workgroups([0, 0, 0]));
+--- baseline/crates/reims-vgpu/src/backend/vulkan/engine/reason.rs
++++ qualified/crates/reims-vgpu/src/backend/vulkan/engine/reason.rs
+@@ -33,6 +33,7 @@
+ /// reader without the one thing they would go looking for next.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum DrawReason {
++    ColorInput(super::color_input::ColorInputDecline),
+     /// A validator rejected the SPIR-V module this device assembled, so it was
+     /// never handed to the driver.
+     ///
+@@ -331,6 +332,7 @@
+     /// check, never shared.
+     fn slug(&self) -> &'static str {
+         match self {
++            Self::ColorInput(r) => r.slug(),
+             Self::SpirvInvalid => "spirv_module_invalid",
+             Self::UsedBindingAbsentFromLayout { .. } => "draw_used_binding_absent_from_layout",
+             Self::DriverCallQuarantined => "driver_call_quarantined",
+@@ -405,6 +407,7 @@
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         write!(f, "reason={}", self.slug())?;
+         match self {
++            Self::ColorInput(r) => { for (k,v) in r.fields() { write!(f," {k}={v}")?; } Ok(()) }
+             Self::UsedBindingAbsentFromLayout { binding, fragment } => {
+                 let stage = if *fragment { "fragment" } else { "vertex" };
+                 write!(f, " binding={binding} stage={stage}")
+--- baseline/crates/reims-vgpu/src/backend/vulkan/caps/device_features.rs
++++ qualified/crates/reims-vgpu/src/backend/vulkan/caps/device_features.rs
+@@ -312,6 +312,10 @@
+     /// attachment self-sampling contract; hosts without it keep the snapshot
+     /// copy rail.
+     pub attachment_feedback_loop_layout: bool,
++    /// Advertised EXT query result, enabled by the matching device feature chain.
++    pub ordered_color_attachment_access: bool,
++    pub max_color_attachments: u32,
++    pub input_attachment_descriptor_limit: u32,
+     /// `VK_EXT_image_drm_format_modifier`, used only for the explicit linear
+     /// plane layout that gives a shared guest target its declared row pitch.
+     /// This is an extension capability rather than a device feature bit: when
+@@ -607,6 +611,11 @@
+     ) -> vk::PhysicalDeviceImageRobustnessFeaturesEXT<'static> {
+         vk::PhysicalDeviceImageRobustnessFeaturesEXT::default()
+             .robust_image_access(self.image_robustness.is_available())
++    }
++
++    pub fn enabled_ordered_color_attachment_access(&self) -> vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT<'static> {
++        vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT::default()
++            .rasterization_order_color_attachment_access(self.ordered_color_attachment_access)
+     }
+ 
+     pub fn enabled_attachment_feedback_loop_layout(
+@@ -700,6 +709,9 @@
+             mirror_clamp_to_edge,
+             image_robustness,
+             attachment_feedback_loop_layout,
++            ordered_color_attachment_access,
++            max_color_attachments,
++            input_attachment_descriptor_limit,
+             image_drm_format_modifier,
+             dual_src_blend,
+             independent_blend,
+@@ -730,6 +742,7 @@
+         format!(
+             "vk_features robust_buffer_access={robust_buffer_access} \
+              image_robustness={image_robustness:?} \
++             ordered_color_attachment_access={ordered_color_attachment_access} max_color_attachments={max_color_attachments} input_attachment_descriptor_limit={input_attachment_descriptor_limit} \
+              attachment_feedback_loop_layout={attachment_feedback_loop_layout} \
+              image_drm_format_modifier={image_drm_format_modifier} \
+              sampler_anisotropy={sampler_anisotropy} max_sampler_anisotropy={max_sampler_anisotropy} \
+@@ -779,6 +792,9 @@
+         }
+         if self.image_robustness == ImageRobustness::ExtImageRobustness {
+             out.push(vk::EXT_IMAGE_ROBUSTNESS_NAME.as_ptr());
++        }
++        if self.ordered_color_attachment_access {
++            out.push(vk::EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_NAME.as_ptr());
+         }
+         if self.attachment_feedback_loop_layout {
+             out.push(vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME.as_ptr());
+@@ -933,6 +949,12 @@
+         } else {
+             false
+         };
++    let ordered_color_attachment_access = if has_extension(vk::EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_NAME) {
++        let mut supported = vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT::default();
++        let mut chain = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported);
++        unsafe { instance.get_physical_device_features2(pd, &mut chain) };
++        supported.rasterization_order_color_attachment_access == vk::TRUE
++    } else { false };
+     let image_drm_format_modifier = has_extension(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME);
+ 
+     // The same rule as `attachment_feedback_loop_layout` above: a structure
+@@ -980,6 +1002,9 @@
+         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
+         image_robustness,
+         attachment_feedback_loop_layout,
++        ordered_color_attachment_access,
++        max_color_attachments: props.limits.max_color_attachments,
++        input_attachment_descriptor_limit: props.limits.max_per_stage_descriptor_input_attachments.min(props.limits.max_descriptor_set_input_attachments),
+         image_drm_format_modifier,
+         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
+         dual_src_blend: supported.dual_src_blend == vk::TRUE,
+@@ -1103,6 +1128,9 @@
+             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
+             image_robustness: ImageRobustness::Core13,
+             attachment_feedback_loop_layout: true,
++            ordered_color_attachment_access: true,
++            max_color_attachments: 8,
++            input_attachment_descriptor_limit: 8,
+             image_drm_format_modifier: true,
+             dual_src_blend: true,
+             independent_blend: true,
+@@ -1380,6 +1408,9 @@
+         let name = vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME.as_ptr();
+         let on = DeviceFeatures {
+             attachment_feedback_loop_layout: true,
++            ordered_color_attachment_access: true,
++            max_color_attachments: 8,
++            input_attachment_descriptor_limit: 8,
+             ..Default::default()
+         };
+         assert_eq!(
+--- baseline/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
++++ qualified/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
+@@ -1221,6 +1221,7 @@
+         // asking for a feature a device declined fails `vkCreateDevice`.
+         let mut en_image_robustness = features.enabled_image_robustness();
+         let mut en_attachment_feedback = features.enabled_attachment_feedback_loop_layout();
++        let mut en_ordered_color = features.enabled_ordered_color_attachment_access();
+         let mut en_extended_dynamic_state = features.enabled_extended_dynamic_state();
+         let mut en_extended_dynamic_state3 = features.enabled_extended_dynamic_state3();
+         let mut dci = vk::DeviceCreateInfo::default()
+@@ -1236,6 +1237,9 @@
+         }
+         if features.image_robustness.is_available() {
+             dci = dci.push_next(&mut en_image_robustness);
++        }
++        if features.ordered_color_attachment_access {
++            dci = dci.push_next(&mut en_ordered_color);
+         }
+         if features.attachment_feedback_loop_layout {
+             dci = dci.push_next(&mut en_attachment_feedback);
+--- baseline/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
++++ qualified/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+@@ -550,7 +550,7 @@
+     /// Both references use GENERAL layout and the subpass carries a BY_REGION
+     /// self-dependency — the Vulkan feedback-loop form MoltenVK lowers to Metal
+     /// programmable blending. `false` keeps the pass byte-identical.
+-    pub color_input: bool,
++    pub color_input: super::color_input::OrderedColorInputs,
+     /// Bit N says colour attachment N is also sampled through
+     /// `VK_EXT_attachment_feedback_loop_layout`. The decoded render pass has at
+     /// most eight colour attachments, so the wire-derived attachment table is
+@@ -573,7 +573,7 @@
+             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
+             secondary_count: 0,
+             depth: None,
+-            color_input: false,
++            color_input: Default::default(),
+             feedback_colors: 0,
+             sample_count: 1,
+             multisample_resolve: false,
+@@ -643,10 +643,20 @@
+         FramebufferCompatibilityKey(key)
+     }
+ 
++    pub(crate) fn color_input_references(self) -> Vec<vk::AttachmentReference> {
++        (0..self.color_input.span()).map(|i| {
++            if self.color_input.contains(i) {
++                vk::AttachmentReference::default().attachment(i as u32).layout(self.color_layout(i))
++            } else {
++                vk::AttachmentReference::default().attachment(vk::ATTACHMENT_UNUSED).layout(vk::ImageLayout::UNDEFINED)
++            }
++        }).collect()
++    }
++
+     pub(crate) fn color_layout(self, index: usize) -> vk::ImageLayout {
+         if self.color_feedback(index) {
+             color_feedback_layout()
+-        } else if index == 0 && (self.color_input || self.host_accessible_color0) {
++        } else if self.color_input.contains(index) || (index == 0 && self.host_accessible_color0) {
+             vk::ImageLayout::GENERAL
+         } else {
+             // The same layout the pass exits at, so an ordinary pass performs no
+@@ -2256,16 +2266,15 @@
+                 .attachment(index)
+                 .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+         });
+-        let input_ref = [vk::AttachmentReference::default()
+-            .attachment(0)
+-            .layout(key.color_layout(0))];
++        let input_ref = key.color_input_references();
+         let mut subpass_desc = vk::SubpassDescription::default()
++            .flags(key.color_input.subpass_flags())
+             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+             .color_attachments(&color_ref);
+         if !resolve_ref.is_empty() {
+             subpass_desc = subpass_desc.resolve_attachments(&resolve_ref);
+         }
+-        if key.color_input {
++        if !key.color_input.is_empty() {
+             subpass_desc = subpass_desc.input_attachments(&input_ref);
+         }
+         if let Some(depth_ref) = &depth_ref {
+@@ -2285,12 +2294,12 @@
+             .dependency_flags(vk::DependencyFlags::BY_REGION);
+         let mut deps: Vec<vk::SubpassDependency> = external_dependencies(
+             key.depth.is_some(),
+-            key.color_input,
++            !key.color_input.is_empty(),
+             key.host_accessible_color0,
+             pass_exit_scope_narrow(),
+         )
+         .to_vec();
+-        if key.color_input {
++        if !key.color_input.is_empty() {
+             deps.push(fetch_dep);
+         }
+         deps.push(color_feedback_self_dependency(key.color_layout(0)));
+@@ -2816,7 +2825,7 @@
+         // `reims_vgpu_vulkan::blend` performs it, above.
+         let blend_att: Vec<vk::PipelineColorBlendAttachmentState> =
+             blend_plans.iter().map(|p| p.native()).collect();
+-        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_att);
++        let blend = vk::PipelineColorBlendStateCreateInfo::default().flags(key.pass.0.color_input.blend_flags()).attachments(&blend_att);
+         // Depth-stencil state: attached ONLY when the pass carries a depth
+         // attachment (Vulkan requires the pipeline's depth-stencil state to be
+         // consistent with the subpass). Without it the color-only pipeline is
+@@ -3241,7 +3250,7 @@
+         assert_ne!(clear.compatibility(), different_format.compatibility());
+ 
+         let mut different_subpass = load;
+-        different_subpass.color_input = true;
++        different_subpass.color_input = super::color_input::OrderedColorInputs::fixture(&[0]);
+         assert_ne!(clear.compatibility(), different_subpass.compatibility());
+ 
+         let mut different_depth = load;
+@@ -3316,7 +3325,7 @@
+             ),
+             (
+                 "color input",
+-                |k| k.color_input = true,
++                |k| k.color_input = super::color_input::OrderedColorInputs::fixture(&[0]),
+                 Some(PassCompatField::ColorInput),
+             ),
+             // Feedback is a property of the draw, and it makes two passes
+@@ -3378,7 +3387,7 @@
+         assert_ne!(plain.compatibility(), transported.compatibility());
+ 
+         let mut input = transported;
+-        input.color_input = true;
++        input.color_input = super::color_input::OrderedColorInputs::fixture(&[0]);
+         assert_ne!(
+             plain.framebuffer_compatibility(),
+             input.framebuffer_compatibility()
+@@ -4294,7 +4303,7 @@
+         key.host_accessible_color0 = true;
+         for color_input in [false, true] {
+             for feedback in [false, true] {
+-                key.color_input = color_input;
++                key.color_input = super::color_input::OrderedColorInputs::fixture(if color_input { &[0] } else { &[] });
+                 key.feedback_colors = u8::from(feedback);
+                 assert_eq!(
+                     key.color_layout(0),
+@@ -4326,7 +4335,7 @@
+     #[test]
+     fn feedback_attachment_layout_is_derived_consistently_from_the_mask() {
+         let mut key = PassKey::single(Color0Load::Preserve, vk::Format::R8G8B8A8_UNORM);
+-        key.color_input = true;
++        key.color_input = super::color_input::OrderedColorInputs::fixture(&[0]);
+         key.feedback_colors = (1 << 0) | (1 << 3);
+ 
+         for index in 0..=MAX_SECONDARY_ATTACH {
+@@ -4408,12 +4417,12 @@
+     fn pass_dependency_count(key: PassKey) -> usize {
+         external_dependencies(
+             key.depth.is_some(),
+-            key.color_input,
++            !key.color_input.is_empty(),
+             key.host_accessible_color0,
+             pass_exit_scope_narrow(),
+         )
+         .len()
+-            + usize::from(key.color_input)
++            + usize::from(!key.color_input.is_empty())
+             + 1
+     }
+ 
+--- baseline/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ qualified/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -2699,6 +2699,10 @@
+         owner.force_device_lost = false;
+     }
+     let ctx = owner.ensure(counters)?;
++    let color_inputs = super::color_input::OrderedColorInputs::admit(
++        req.color_input, &ctx.features,
++        req.secondary_targets.len().checked_add(1).ok_or_else(|| super::color_input::refusal(super::color_input::ColorInputDecline::PhysicalCapacity { requested:usize::MAX,limit:ctx.features.max_color_attachments }))?
++    )?;
+     pools.ensure_init(ctx, counters)?;
+ 
+     // Draw batching (deferred submit): a draw that hands the CPU nothing
+@@ -2971,9 +2975,9 @@
+             count: 1,
+         });
+     }
+-    if req.color_input {
++    for input in color_inputs.iter() {
+         layout_bindings.push(BindingSig {
+-            binding: super::types::COLOR_INPUT_BINDING,
++            binding: super::types::COLOR_INPUT_BINDING + input.get() as u32,
+             ty: vk::DescriptorType::INPUT_ATTACHMENT.as_raw() as u32,
+             stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
+             count: 1,
+@@ -3078,7 +3082,7 @@
+         };
+     }
+     pass_key.secondary_count = req.secondary_targets.len() as u8;
+-    pass_key.color_input = req.color_input;
++    pass_key.color_input = color_inputs;
+     for resource in &req.sampled_images {
+         if let Some(index) =
+             feedback_color_index(req, resource, ctx.features.attachment_feedback_loop_layout)
+@@ -3150,12 +3154,12 @@
+                 },
+             ));
+         }
+-        if !req.secondary_targets.is_empty() || req.color_input {
++        if !req.secondary_targets.is_empty() || !req.color_input.is_empty() {
+             return Err(DrawError::Unsupported(
+                 super::reason::DrawReason::MultisampleResolveShapeUnsupported {
+                     color_targets: 1u32.saturating_add(req.secondary_targets.len() as u32),
+                     depth: req.depth.is_some(),
+-                    color_input: req.color_input,
++                    color_input: !req.color_input.is_empty(),
+                 },
+             ));
+         }
+@@ -3620,7 +3624,7 @@
+     // slot's cached framebuffer was built against. One predicate, because the
+     // two answers it feeds have to agree: which pass the slot is ensured under,
+     // and whether the draw builds (and later disposes) a framebuffer of its own.
+-    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
++    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || !req.color_input.is_empty();
+     let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
+     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
+         let mut color_only = PassKey::single(pass_key.color0_load, pass_key.color0_format);
+@@ -3659,6 +3663,7 @@
+     let mut target_guest_backed = false;
+     let mut target_loads_guest_backing = false;
+     let mut target_guest_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint> = None;
++    let mut color_views = [None; reims_vgpu_core::pass::COLOR_ATTACHMENTS];
+     let (target_image, mut target_fb, target_access, target_view) =
+         if let Some(identity) = &req.target_identity {
+             let gen = identity.generation();
+@@ -3714,6 +3719,7 @@
+                     primary_view,
+                     depth_attachment.as_ref().map(|d| d.view),
+                     &mut mrt_secondaries,
++                    &mut color_views,
+                 )?;
+                 let fb = pools.ensure_ad_hoc_framebuffer(
+                     ctx,
+@@ -3750,6 +3756,7 @@
+                     pool_view,
+                     depth_attachment.as_ref().map(|d| d.view),
+                     &mut mrt_secondaries,
++                    &mut color_views,
+                 )?;
+                 let fb = pools.ensure_ad_hoc_framebuffer(
+                     ctx,
+@@ -4284,7 +4291,11 @@
+     // Framebuffer fetch: the input attachment IS the color target's view;
+     // derive the same layout as the subpass reference. A draw that also
+     // samples the target upgrades both from GENERAL to the feedback layout.
+-    let color_input_layout = pass_key.color_layout(0);
++    color_views[0] = Some(target_view);
++    let input_views = color_inputs.iter().map(|input| {
++        let view = color_views[input.get()].ok_or_else(|| super::color_input::refusal(super::color_input::ColorInputDecline::MissingAttachment { index: input.get() }))?;
++        Ok((input, view, pass_key.color_layout(input.get())))
++    }).collect::<Result<Vec<_>, DrawError>>()?;
+     // This draw's bindings, as this device's own list rather than as Vulkan's
+     // write structures.
+     //
+@@ -4307,7 +4318,7 @@
+         storage_binds,
+         &sampled,
+         &sampler_handles,
+-        req.color_input.then_some((target_view, color_input_layout)),
++        &input_views,
+     );
+     if let Some(dset) = dset {
+         // An allocated set is fresh out of the pool and carries nothing, so
+@@ -6042,9 +6053,11 @@
+         vk::Image,
+         super::pools::ResidentAccess,
+     )>,
++    color_views: &mut [Option<vk::ImageView>; reims_vgpu_core::pass::COLOR_ATTACHMENTS],
+ ) -> Result<Vec<vk::ImageView>, DrawError> {
+     let mut views = vec![primary_view];
+-    for sec in &req.secondary_targets {
++    color_views[0] = Some(primary_view);
++    for (index, sec) in req.secondary_targets.iter().enumerate() {
+         let prior = pools.registry_get(&sec.identity);
+         let old_access = prior
+             .map(|s| s.access)
+@@ -6079,6 +6092,7 @@
+             counters,
+         )?;
+         views.push(view);
++        color_views[index + 1] = Some(view);
+         mrt_secondaries.push((sec.identity.clone(), img, old_access));
+     }
+     views.extend(depth_view);
+@@ -6167,7 +6181,7 @@
+     storage_slots: &[(u32, BoundBuffer, u64)],
+     sampled: &[PreparedSampled],
+     sampler_handles: &[(u32, vk::Sampler)],
+-    color_input: Option<(vk::ImageView, vk::ImageLayout)>,
++    color_input: &[(reims_vgpu_core::pass::ColorInputIndex, vk::ImageView, vk::ImageLayout)],
+ ) {
+     out.extend(storage_slots.iter().map(|(binding, bound, len)| {
+         super::pools::PushDescriptorBinding::Buffer {
+@@ -6201,9 +6215,9 @@
+             layout: vk::ImageLayout::UNDEFINED,
+         }
+     }));
+-    if let Some((view, layout)) = color_input {
++    for &(input, view, layout) in color_input {
+         out.push(super::pools::PushDescriptorBinding::Image {
+-            binding: super::types::COLOR_INPUT_BINDING,
++            binding: super::types::COLOR_INPUT_BINDING + input.get() as u32,
+             array_element: 0,
+             ty: vk::DescriptorType::INPUT_ATTACHMENT,
+             sampler: vk::Sampler::null(),
+--- baseline/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ qualified/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -7587,28 +7587,15 @@
+             frag_unbound_textures_to_neutralize(&uses)
+         };
+ 
+-        // Framebuffer fetch (`air.render_target` INPUT param `dest_N` →
+-        // reflection `ColorInput` at binding 96+N): the engine supports the
+-        // attachment-0 fetch as a Vulkan subpass input. `dest_N>0` (fetching a
+-        // secondary MRT attachment) has no engine path yet — fail visibly, never
+-        // execute a shader whose destination read would be unbound.
++        // Reflection carries guest InputAttachmentIndex N and binding 192+N.
++        // Parse the bounded semantic slots once; execution admits the physical
++        // attachments and ordered host capability before creating any pass.
+         let frag_color_input = {
+             use metal2vulkan::reflect::ResourceKind;
+-            let mut fetch0 = false;
+-            for rb in &f_shader.reflection.bindings {
+-                if rb.kind == ResourceKind::ColorInput {
+-                    if rb.metal_index == 0 {
+-                        fetch0 = true;
+-                    } else {
+-                        return Err(DrawError::DrawPreparation(
+-                            DrawPreparationDecline::ColorInputMrtUnsupported {
+-                                destination_index: rb.metal_index,
+-                            },
+-                        ));
+-                    }
+-                }
+-            }
+-            fetch0
++            reims_vgpu_core::pass::ColorInputs::parse(f_shader.reflection.bindings.iter()
++                .filter(|b| b.kind == ResourceKind::ColorInput).map(|b| b.metal_index))
++                .map_err(|e| crate::backend::vulkan::engine::color_input::refusal(
++                    crate::backend::vulkan::engine::color_input::ColorInputDecline::InvalidIndex(e)))?
+         };
+         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Sampled);
+         // The four `sampled_phase` spans below divide this phase's `sampled_us`,
+--- baseline/crates/reims-vgpu/src/backend/vulkan/engine/desc_arena.rs
++++ qualified/crates/reims-vgpu/src/backend/vulkan/engine/desc_arena.rs
+@@ -151,7 +151,12 @@
+     }
+ 
+     unsafe fn create_block(device: &ash::Device) -> Result<vk::DescriptorPool, DrawError> {
++        let input_budget = (reims_vgpu_core::pass::COLOR_ATTACHMENTS as u32)
++            .checked_mul(DESC_BLOCK_MAX_SETS).expect("bounded input slots and pool sets");
+         let pool_sizes = [
++            vk::DescriptorPoolSize::default()
++                .ty(vk::DescriptorType::INPUT_ATTACHMENT)
++                .descriptor_count(input_budget),
+             vk::DescriptorPoolSize::default()
+                 .ty(vk::DescriptorType::STORAGE_BUFFER)
+                 .descriptor_count(DESC_BLOCK_PER_TYPE),
+--- baseline/crates/reims-vgpu/tests/vk_engine_parity.rs
++++ qualified/crates/reims-vgpu/tests/vk_engine_parity.rs
+@@ -4166,7 +4166,7 @@
+     let f = translate_words("render_frag_fetch.air", Stage::Fragment);
+     let (w, h) = (16u32, 16u32);
+     let mut req = engine_req(&v, &f, w, h);
+-    req.color_input = true;
++    req.color_input = engine::ColorInputs::parse([0]).unwrap();
+     // Seed (64, 128, 191, 255) → expect ~(191, 127, 64, 255).
+     req.target_rgba8 = Some(std::sync::Arc::new(
+         [64, 128, 191, 255].repeat((w * h) as usize),

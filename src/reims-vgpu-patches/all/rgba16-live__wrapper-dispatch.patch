@@ -1,0 +1,11 @@
+--- a/local-raw/run-crypto-frames-attempt.py
++++ b/local-raw/run-crypto-frames-attempt.py
+@@ -173,6 +173,8 @@
+         from golden_m27_pages_io_profile import QEMU, QEMU_SHA
+     elif os.environ.get('LOCAL_RAW_QEMU') == 'm27-pages-rgb10':
+         from golden_m27_pages_rgb10_profile import QEMU, QEMU_SHA
++    elif os.environ.get('LOCAL_RAW_QEMU') == 'm27-pages-rgba16':
++        from golden_m27_pages_rgba16_profile import QEMU, QEMU_SHA
+     if QEMU_SHA is None:
+         raise SystemExit('Selected emulator build admission is closed')
+     runner = load_runner()

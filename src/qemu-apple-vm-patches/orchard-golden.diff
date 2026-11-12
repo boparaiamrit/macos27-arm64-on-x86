@@ -1,0 +1,238 @@
+diff --git a/qemu/hw/display/meson.build b/qemu/hw/display/meson.build
+index 8b17fe8..e0243bb 100644
+--- a/qemu/hw/display/meson.build
++++ b/qemu/hw/display/meson.build
+@@ -156,40 +156,49 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
+     reims_vgpu_repo_dir = meson.project_source_root() / '..' / 'reims-vgpu'
+   endif
+   reims_vgpu_abi_header_dir = reims_vgpu_repo_dir / 'crates' / 'reims-vgpu' / 'include'
+-  cargo = find_program('cargo')
+-  reims_vgpu_rust_sys_libs = ['-lm', '-ldl', '-lpthread']
+-  reims_vgpu_cargo_features = '--no-default-features --features backend-vulkan,host-window'
+-  reims_vgpu_link_args = reims_vgpu_rust_sys_libs
+-  # A cross build must hand cargo the same target and C compiler as meson,
+-  # or the host-architecture archive in target/release is linked instead.
+-  reims_vgpu_cargo_env = ''
+-  reims_vgpu_cargo_target = ''
+-  reims_vgpu_built = reims_vgpu_repo_dir / 'target' / 'release' / 'libreims_vgpu.a'
+-  if meson.is_cross_build()
+-    reims_vgpu_rust_triple = host_machine.cpu_family() + '-unknown-linux-gnu'
+-    reims_vgpu_env_triple = reims_vgpu_rust_triple.underscorify()
+-    reims_vgpu_cc = meson.get_compiler('c').cmd_array()[0]
+-    reims_vgpu_cargo_env = 'CC_' + reims_vgpu_env_triple + '="' + reims_vgpu_cc + '" ' + \
+-      'CARGO_TARGET_' + reims_vgpu_env_triple.to_upper() + '_LINKER="' + reims_vgpu_cc + '" '
+-    reims_vgpu_cargo_target = ' --target ' + reims_vgpu_rust_triple
+-    reims_vgpu_built = reims_vgpu_repo_dir / 'target' / reims_vgpu_rust_triple / 'release' / 'libreims_vgpu.a'
++  # Optional prebuilt dependency for isolated builds. The package must name
++  # the same ABI headers and archive; no GPU/runtime features are changed.
++  reims_vgpu_prebuilt = dependency('reims-vgpu', required: false,
++                                  method: 'pkg-config', static: true)
++  if reims_vgpu_prebuilt.found()
++    reims_vgpu_header_dep = reims_vgpu_prebuilt
++    reims_vgpu_dep = reims_vgpu_prebuilt
++  else
++    cargo = find_program('cargo')
++    reims_vgpu_rust_sys_libs = ['-lm', '-ldl', '-lpthread']
++    reims_vgpu_cargo_features = '--no-default-features --features backend-vulkan,host-window'
++    reims_vgpu_link_args = reims_vgpu_rust_sys_libs
++    # A cross build must hand cargo the same target and C compiler as meson,
++    # or the host-architecture archive in target/release is linked instead.
++    reims_vgpu_cargo_env = ''
++    reims_vgpu_cargo_target = ''
++    reims_vgpu_built = reims_vgpu_repo_dir / 'target' / 'release' / 'libreims_vgpu.a'
++    if meson.is_cross_build()
++      reims_vgpu_rust_triple = host_machine.cpu_family() + '-unknown-linux-gnu'
++      reims_vgpu_env_triple = reims_vgpu_rust_triple.underscorify()
++      reims_vgpu_cc = meson.get_compiler('c').cmd_array()[0]
++      reims_vgpu_cargo_env = 'CC_' + reims_vgpu_env_triple + '="' + reims_vgpu_cc + '" ' + \
++        'CARGO_TARGET_' + reims_vgpu_env_triple.to_upper() + '_LINKER="' + reims_vgpu_cc + '" '
++      reims_vgpu_cargo_target = ' --target ' + reims_vgpu_rust_triple
++      reims_vgpu_built = reims_vgpu_repo_dir / 'target' / reims_vgpu_rust_triple / 'release' / 'libreims_vgpu.a'
++    endif
++    reims_vgpu_a = custom_target('reims-vgpu-staticlib',
++      output: 'libreims_vgpu.a',
++      console: true,
++      build_always_stale: true,
++      command: [find_program('sh'), '-c',
++        reims_vgpu_cargo_env + '"' + cargo.full_path() + '" build --release' +
++        reims_vgpu_cargo_target + ' --manifest-path "' +
++        reims_vgpu_repo_dir + '/Cargo.toml" -p reims-vgpu ' + reims_vgpu_cargo_features +
++        ' && ( cmp -s "' + reims_vgpu_built + '" "@OUTPUT@" || cp "' +
++        reims_vgpu_built + '" "@OUTPUT@" )'])
++    reims_vgpu_header_dep = declare_dependency(
++      compile_args: ['-I' + reims_vgpu_abi_header_dir])
++    reims_vgpu_dep = declare_dependency(
++      link_with: reims_vgpu_a,
++      link_args: reims_vgpu_link_args,
++      compile_args: ['-I' + reims_vgpu_abi_header_dir])
+   endif
+-  reims_vgpu_a = custom_target('reims-vgpu-staticlib',
+-    output: 'libreims_vgpu.a',
+-    console: true,
+-    build_always_stale: true,
+-    command: [find_program('sh'), '-c',
+-      reims_vgpu_cargo_env + '"' + cargo.full_path() + '" build --release' +
+-      reims_vgpu_cargo_target + ' --manifest-path "' +
+-      reims_vgpu_repo_dir + '/Cargo.toml" -p reims-vgpu ' + reims_vgpu_cargo_features +
+-      ' && ( cmp -s "' + reims_vgpu_built + '" "@OUTPUT@" || cp "' +
+-      reims_vgpu_built + '" "@OUTPUT@" )'])
+-  reims_vgpu_header_dep = declare_dependency(
+-    compile_args: ['-I' + reims_vgpu_abi_header_dir])
+-  reims_vgpu_dep = declare_dependency(
+-    link_with: reims_vgpu_a,
+-    link_args: reims_vgpu_link_args,
+-    compile_args: ['-I' + reims_vgpu_abi_header_dir])
+   system_ss.add(when: 'CONFIG_REIMS_VGPU',
+     if_true: [files('reims-vgpu-dirty.c', 'reims-vgpu-shim.c'), reims_vgpu_header_dep])
+   specific_ss.add(when: 'CONFIG_REIMS_VGPU',
+diff --git a/qemu/hw/virtio/virtio-net-pci.c b/qemu/hw/virtio/virtio-net-pci.c
+index fd3e030..4a6c47a 100644
+--- a/qemu/hw/virtio/virtio-net-pci.c
++++ b/qemu/hw/virtio/virtio-net-pci.c
+@@ -36,9 +36,12 @@ DECLARE_INSTANCE_CHECKER(VirtIONetPCI, VIRTIO_NET_PCI,
+ struct VirtIONetPCI {
+     VirtIOPCIProxy parent_obj;
+     VirtIONet vdev;
++    bool ascending_capabilities;
+ };
+ 
+ static const Property virtio_net_properties[] = {
++    DEFINE_PROP_BOOL("x-ascending-capabilities", VirtIONetPCI,
++                     ascending_capabilities, false),
+     DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
+                     VIRTIO_PCI_FLAG_USE_IOEVENTFD_BIT, true),
+     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,
+@@ -61,6 +64,28 @@ static void virtio_net_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
+     virtio_net_set_netclient_name(&dev->vdev, qdev->id,
+                                   object_get_typename(OBJECT(qdev)));
+     qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
++
++    if (dev->ascending_capabilities && qdev_is_realized(vdev)) {
++        uint8_t *config = vpci_dev->pci_dev.config;
++        bool capabilities[PCI_CONFIG_SPACE_SIZE] = { false };
++        unsigned offset, previous = PCI_CAPABILITY_LIST;
++
++        /* Local Golden Gate workaround: its cached and fallback capability
++         * lookups revisit PCI_CFG and NOTIFY forever on descending lists.
++         * Keep capability contents and offsets; only reorder the links. */
++        for (offset = config[PCI_CAPABILITY_LIST]; offset;
++             offset = config[offset + PCI_CAP_LIST_NEXT]) {
++            capabilities[offset] = true;
++        }
++        for (offset = PCI_CONFIG_HEADER_SIZE; offset < PCI_CONFIG_SPACE_SIZE;
++             offset++) {
++            if (capabilities[offset]) {
++                config[previous] = offset;
++                previous = offset + PCI_CAP_LIST_NEXT;
++            }
++        }
++        config[previous] = 0;
++    }
+ }
+ 
+ static void virtio_net_pci_class_init(ObjectClass *klass, const void *data)
+diff --git a/qemu/hw/vmapple/virtio-blk.c b/qemu/hw/vmapple/virtio-blk.c
+index 9de9aaa..0a52972 100644
+--- a/qemu/hw/vmapple/virtio-blk.c
++++ b/qemu/hw/vmapple/virtio-blk.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "hw/pci/pci.h"
+ #include "hw/vmapple/vmapple.h"
+ #include "hw/virtio/virtio-blk.h"
+ #include "hw/virtio/virtio-pci.h"
+@@ -44,6 +45,8 @@ typedef struct VMAppleVirtIOBlk {
+ OBJECT_DECLARE_SIMPLE_TYPE(VMAppleVirtIOBlkPCI, VMAPPLE_VIRTIO_BLK_PCI)
+ 
+ #define VIRTIO_BLK_T_APPLE_BARRIER     0x10000
++#define VMAPPLE_PCI_VNDR_SIZE 14
++#define VMAPPLE_PCI_VNDR_DISABLE_ENCRYPTION 1
+ 
+ static bool vmapple_virtio_blk_handle_unknown_request(VirtIOBlockReq *req,
+                                                       MultiReqBuffer *mrb,
+@@ -125,6 +128,10 @@ static void vmapple_virtio_blk_pci_realize(VirtIOPCIProxy *vpci_dev, Error **err
+     VMAppleVirtIOBlkPCI *dev = VMAPPLE_VIRTIO_BLK_PCI(vpci_dev);
+     DeviceState *vdev = DEVICE(&dev->vdev);
+     VirtIOBlkConf *conf = &dev->vdev.parent_obj.conf;
++    int offset;
++    uint8_t capabilities[PCI_CONFIG_SPACE_SIZE] = { 0 };
++    uint8_t *config = vpci_dev->pci_dev.config;
++    int previous = PCI_CAPABILITY_LIST;
+ 
+     if (dev->variant == VM_APPLE_VIRTIO_BLK_VARIANT_UNSPECIFIED) {
+         error_setg(errp, "vmapple virtio block device variant unspecified");
+@@ -162,6 +169,38 @@ static void vmapple_virtio_blk_pci_realize(VirtIOPCIProxy *vpci_dev, Error **err
+     pci_config_set_vendor_id(vpci_dev->pci_dev.config, PCI_VENDOR_ID_APPLE);
+     pci_config_set_device_id(vpci_dev->pci_dev.config,
+                              PCI_DEVICE_ID_APPLE_VIRTIO_BLK);
++    pci_set_word(vpci_dev->pci_dev.config + PCI_SUBSYSTEM_ID, 0x1100);
++
++    /* A non-FileVault Golden Gate root disk requires Apple's vendor
++     * capability to advertise that transport encryption is disabled. */
++    offset = pci_add_capability(&vpci_dev->pci_dev, PCI_CAP_ID_VNDR, 0,
++                                VMAPPLE_PCI_VNDR_SIZE, errp);
++    if (offset < 0) {
++        return;
++    }
++    pci_set_byte(vpci_dev->pci_dev.config + offset + 2,
++                 VMAPPLE_PCI_VNDR_SIZE);
++    pci_set_byte(vpci_dev->pci_dev.config + offset + 3, 9);
++    pci_set_word(vpci_dev->pci_dev.config + offset + 4, PCI_VENDOR_ID_APPLE);
++    pci_set_byte(vpci_dev->pci_dev.config + offset + 6,
++                 VMAPPLE_PCI_VNDR_DISABLE_ENCRYPTION);
++
++    /* Golden Gate's cached capability lookup and its fallback disagree on
++     * descending lists: the storage probe alternates between the final
++     * vendor capability and VIRTIO_PCI_CAP_PCI_CFG forever. Keep the same
++     * capabilities and offsets, but enumerate them in address order. */
++    for (offset = config[PCI_CAPABILITY_LIST]; offset;
++         offset = config[offset + PCI_CAP_LIST_NEXT]) {
++        capabilities[offset] = 1;
++    }
++    for (offset = PCI_CONFIG_HEADER_SIZE; offset < PCI_CONFIG_SPACE_SIZE;
++         offset++) {
++        if (capabilities[offset]) {
++            config[previous] = offset;
++            previous = offset + PCI_CAP_LIST_NEXT;
++        }
++    }
++    config[previous] = 0;
+ }
+ 
+ static void vmapple_virtio_blk_pci_class_init(ObjectClass *klass,
+diff --git a/qemu/hw/vmapple/vmapple.c b/qemu/hw/vmapple/vmapple.c
+index 9677aa4..2facdfe 100644
+--- a/qemu/hw/vmapple/vmapple.c
++++ b/qemu/hw/vmapple/vmapple.c
+@@ -719,6 +719,11 @@ static GlobalProperty vmapple_compat_defaults[] = {
+      * mapping in the XHCI controller works around the problem.
+      */
+     { TYPE_XHCI_PCI, "conditional-intr-mapping", "on" },
++    /*
++     * macOS 27's virtio PCI transport never starts a device whose
++     * capabilities are linked from high offsets to low.
++     */
++    { "virtio-net-pci-base", "x-ascending-capabilities", "on" },
+ };
+ 
+ static bool vmapple_get_gfx(Object *obj, Error **errp)
+@@ -799,8 +804,16 @@ static const TypeInfo vmapple_machine_info = {
+ static void apple_vm_machine_class_init(ObjectClass *oc, const void *data)
+ {
+     MachineClass *mc = MACHINE_CLASS(oc);
++    static GlobalProperty golden_net_defaults[] = {
++        { "virtio-net-pci-base", "x-ascending-capabilities", "on" },
++    };
++
++    /* machine_class_base_init() gives each concrete subclass a fresh
++     * compat_props array. Apply Golden Gate's network default here too. */
++    compat_props_add(mc->compat_props, golden_net_defaults,
++                     G_N_ELEMENTS(golden_net_defaults));
+ 
+-    /* Parent (vmapple) class_init has already run; override only the CPU. */
++    /* Parent (vmapple) class_init has already run; override the CPU. */
+     mc->default_cpu_type = TYPE_APPLE_VM_CPU;
+     mc->desc = "Apple aarch64 Virtual Machine (Orchard, custom CPU)";
+ }

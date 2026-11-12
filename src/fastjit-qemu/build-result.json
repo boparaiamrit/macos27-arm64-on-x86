@@ -1,0 +1,6 @@
+{
+  "status": "BUILD_PASS",
+  "qemu_sha256": "da0fe91b663a2b5f271ac39a46250e0121ec54a42c9ff2b7d0e14cc4dc61fcca",
+  "libreims_sha256": "9fd226fd1849c6a3d76faccf456192eff12534da6739756d227e50f8b6cf15c9",
+  "elapsed_seconds": 178.6
+}

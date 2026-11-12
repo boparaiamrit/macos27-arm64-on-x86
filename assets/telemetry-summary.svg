@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 340" width="980" height="340">
+  <rect width="980" height="340" rx="16" fill="#0b1020" stroke="#1f2937" stroke-width="2"/>
+  <text x="32" y="38" fill="#f9fafb" font-family="system-ui, sans-serif" font-size="18" font-weight="700">Session Progression: Zero-Loss NBD Cache Warmup &amp; FastJIT Execution Telemetry</text>
+  <text x="32" y="58" fill="#9ca3af" font-family="ui-monospace, monospace" font-size="11.5">Measured across Warm Boots #1 → #10 on x86_64 (QEMU apple-vm MTTCG smp=10 + FastJIT + Mesa Lavapipe LP128)</text>
+
+  <!-- Left Chart: FastJIT Native Instructions -->
+  <rect x="32" y="76" width="446" height="238" rx="10" fill="#131c2e" stroke="#1e293b"/>
+  <text x="50" y="102" fill="#e2e8f0" font-family="system-ui, sans-serif" font-size="13" font-weight="700">FastJIT Native Throughput (Warm Boot #10)</text>
+  <line x1="80" y1="125" x2="450" y2="125" stroke="#1e293b" stroke-dasharray="3,3"/>
+  <line x1="80" y1="168" x2="450" y2="168" stroke="#1e293b" stroke-dasharray="3,3"/>
+  <line x1="80" y1="211" x2="450" y2="211" stroke="#1e293b" stroke-dasharray="3,3"/>
+  <line x1="80" y1="254" x2="450" y2="254" stroke="#475569"/>
+  <text x="72" y="129" text-anchor="end" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">1.8B</text>
+  <text x="72" y="172" text-anchor="end" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">1.2B</text>
+  <text x="72" y="215" text-anchor="end" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">0.6B</text>
+  <text x="72" y="258" text-anchor="end" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">0</text>
+  <!-- Native x86_64 insns -->
+  <polyline fill="none" stroke="#38bdf8" stroke-width="3" points="80,253 142,235 204,210 266,188 328,165 390,145 450,128"/>
+  <!-- Executed AArch64 blocks -->
+  <polyline fill="none" stroke="#34d399" stroke-width="2.5" points="80,253 142,243 204,228 266,215 328,200 390,189 450,179"/>
+  <circle cx="266" cy="188" r="4.5" fill="#fbbf24"/>
+  <text x="266" y="176" text-anchor="middle" fill="#fbbf24" font-family="ui-monospace, monospace" font-size="10" font-weight="700">present_content @147.7s</text>
+  <text x="80" y="274" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">0s</text>
+  <text x="204" y="274" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">92s (WS ch3)</text>
+  <text x="328" y="274" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">200s</text>
+  <text x="450" y="274" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">300s</text>
+  <rect x="92" y="290" width="12" height="4" fill="#38bdf8"/>
+  <text x="110" y="296" fill="#cbd5e1" font-family="ui-monospace, monospace" font-size="10.5">1.750B Native x86_64 Insns</text>
+  <rect x="285" y="290" width="12" height="4" fill="#34d399"/>
+  <text x="303" y="296" fill="#cbd5e1" font-family="ui-monospace, monospace" font-size="10.5">1.044B Executed Blocks</text>
+
+  <!-- Right Chart: NBD Cache Growth -->
+  <rect x="502" y="76" width="446" height="238" rx="10" fill="#131c2e" stroke="#1e293b"/>
+  <text x="520" y="102" fill="#e2e8f0" font-family="system-ui, sans-serif" font-size="13" font-weight="700">In-RAM 64 KiB Disk Block Cache (zero_fills = 0)</text>
+  <line x1="555" y1="125" x2="925" y2="125" stroke="#1e293b" stroke-dasharray="3,3"/>
+  <line x1="555" y1="168" x2="925" y2="168" stroke="#1e293b" stroke-dasharray="3,3"/>
+  <line x1="555" y1="211" x2="925" y2="211" stroke="#1e293b" stroke-dasharray="3,3"/>
+  <line x1="555" y1="254" x2="925" y2="254" stroke="#475569"/>
+  <text x="547" y="129" text-anchor="end" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">45k</text>
+  <text x="547" y="172" text-anchor="end" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">30k</text>
+  <text x="547" y="215" text-anchor="end" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">15k</text>
+  <text x="547" y="258" text-anchor="end" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">0</text>
+
+  <rect x="572" y="236" width="38" height="18" rx="4" fill="#6366f1"/>
+  <text x="591" y="230" text-anchor="middle" fill="#cbd5e1" font-family="ui-monospace, monospace" font-size="9.5">6.1k</text>
+  <text x="591" y="272" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">Base</text>
+
+  <rect x="632" y="212" width="38" height="42" rx="4" fill="#6366f1"/>
+  <text x="651" y="206" text-anchor="middle" fill="#cbd5e1" font-family="ui-monospace, monospace" font-size="9.5">14.6k</text>
+  <text x="651" y="272" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">Boot #4</text>
+
+  <rect x="692" y="177" width="38" height="77" rx="4" fill="#6366f1"/>
+  <text x="711" y="171" text-anchor="middle" fill="#cbd5e1" font-family="ui-monospace, monospace" font-size="9.5">26.7k</text>
+  <text x="711" y="272" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">Boot #7</text>
+
+  <rect x="752" y="157" width="38" height="97" rx="4" fill="#38bdf8"/>
+  <text x="771" y="151" text-anchor="middle" fill="#cbd5e1" font-family="ui-monospace, monospace" font-size="9.5">33.7k</text>
+  <text x="771" y="272" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">Boot #8</text>
+
+  <rect x="812" y="140" width="38" height="114" rx="4" fill="#34d399"/>
+  <text x="831" y="134" text-anchor="middle" fill="#cbd5e1" font-family="ui-monospace, monospace" font-size="9.5">39.7k</text>
+  <text x="831" y="272" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">Boot #9</text>
+
+  <rect x="872" y="134" width="38" height="120" rx="4" fill="#10b981"/>
+  <text x="891" y="128" text-anchor="middle" fill="#34d399" font-family="ui-monospace, monospace" font-size="10" font-weight="700">41.8k</text>
+  <text x="891" y="272" text-anchor="middle" fill="#f8fafc" font-family="ui-monospace, monospace" font-size="10" font-weight="700">Boot #10</text>
+
+  <text x="725" y="296" text-anchor="middle" fill="#34d399" font-family="ui-monospace, monospace" font-size="10.5">41,755 Cached 64 KiB Blocks = 2.61 GiB Working Set · 0 Corrupt/Zeroed Reads</text>
+</svg>

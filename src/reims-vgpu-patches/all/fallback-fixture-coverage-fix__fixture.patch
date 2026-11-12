@@ -1,0 +1,15 @@
+--- before/crates/reims-vgpu/src/backend/vulkan/engine/linear-import-fallback-tests.rs
++++ fixed/crates/reims-vgpu/src/backend/vulkan/engine/linear-import-fallback-tests.rs
+@@ -59,9 +59,11 @@
+         )
+         .unwrap();
+         GuestRunSource {
+-            runs: Arc::new(vec![GuestRun::whole(
++            runs: Arc::new(vec![GuestRun::in_mapping(
+                 self.pointer as usize,
+                 self.layout.size() as u64,
++                0,
++                PIXEL_BYTES as u64,
+             )
+             .unwrap()]),
+             source_offset: 0,

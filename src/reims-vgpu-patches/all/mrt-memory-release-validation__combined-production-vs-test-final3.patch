@@ -1,0 +1,369 @@
+--- baseline/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
++++ approved-fixed/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
+@@ -112,6 +112,28 @@
+         // block indices mean different things.
+         BufferBacking::Slab(token) => slabs.release(device, token),
+     }
++}
++
++/// Release engine-owned image backing after every view and the image are dead.
++/// The slab ledger is authoritative for shared ranges; an untracked allocation
++/// is dedicated. Guest-import parents have a different owner and never enter.
++unsafe fn release_image_backing(
++    device: &ash::Device,
++    pool: &mut slab::SlabPool,
++    image: vk::Image,
++    memory: vk::DeviceMemory,
++) {
++    let shared = pool.free_image(device, image);
++    if !shared {
++        device.free_memory(memory, None);
++    }
++    #[cfg(test)]
++    eprintln!(
++        "PARENT_IMAGE_BACKING_RELEASE image={:#x} memory={:#x} owner={}",
++        image.as_raw(),
++        memory.as_raw(),
++        if shared { "slab" } else { "dedicated" }
++    );
+ }
+ 
+ pub(crate) struct TargetSlot {
+@@ -1355,9 +1377,7 @@
+                 // sub-allocation, and freeing memory under a live image is UB.
+                 device.destroy_image_view(view, None);
+                 device.destroy_image(image, None);
+-                if !self.slab.free_image(device, image) {
+-                    device.free_memory(memory, None);
+-                }
++                release_image_backing(device, &mut self.slab, image, memory);
+             }
+             DeferredHandle::GuestImage {
+                 image,
+@@ -1381,16 +1401,12 @@
+             DeferredHandle::RecycleSampled(slot) => {
+                 device.destroy_image_view(slot.view, None);
+                 device.destroy_image(slot.image, None);
+-                if !self.slab.free_image(device, slot.image) {
+-                    device.free_memory(slot.memory, None);
+-                }
++                release_image_backing(device, &mut self.slab, slot.image, slot.memory);
+             }
+             DeferredHandle::RecycleTarget(img) => {
+                 device.destroy_image_view(img.view, None);
+                 device.destroy_image(img.image, None);
+-                if !self.slab.free_image(device, img.image) {
+-                    device.free_memory(img.memory, None);
+-                }
++                release_image_backing(device, &mut self.slab, img.image, img.memory);
+             }
+             DeferredHandle::ImageView(view) => device.destroy_image_view(view, None),
+             DeferredHandle::Framebuffer(fb) => device.destroy_framebuffer(fb, None),
+@@ -2129,7 +2145,8 @@
+ 
+ /// Ownership route for a resident image's memory.
+ ///
+-/// A recyclable allocation belongs to the image slab and may re-enter the
++/// A recyclable allocation is engine-owned, either shared-slab or dedicated,
++/// and may re-enter the
+ /// geometry-keyed target pool. A guest import aliases one particular surface
+ /// allocation, so recycling it under another identity would bind that surface's
+ /// pages to unrelated guest work. The enum forces every retirement path to
+@@ -3495,6 +3512,15 @@
+     let result = ctx.device.allocate_memory(info, None);
+     let us = started.elapsed().as_micros() as u64;
+     let i = site.idx();
++    #[cfg(test)]
++    if let Ok(memory) = &result {
++        eprintln!(
++            "PARENT_MEMORY_ALLOC site={} memory={:#x} bytes={}",
++            ALLOC_SITE_NAMES[i],
++            memory.as_raw(),
++            info.allocation_size
++        );
++    }
+     ALLOC_SITE_COUNT[i].fetch_add(1, Ordering::Relaxed);
+     ALLOC_SITE_BYTES[i].fetch_add(info.allocation_size, Ordering::Relaxed);
+     ALLOC_SITE_US[i].fetch_add(us, Ordering::Relaxed);
+--- baseline/crates/reims-vgpu/src/backend/vulkan/engine/pools/teardown.rs
++++ approved-fixed/crates/reims-vgpu/src/backend/vulkan/engine/pools/teardown.rs
+@@ -126,10 +126,10 @@
+         for (_, fb) in self.ad_hoc_framebuffers.drain() {
+             device.destroy_framebuffer(fb, None);
+         }
+-        // Sampled / target / registry images are slab-backed: destroy the image
+-        // + view handles here, but their memory belongs to shared blocks freed
+-        // once by `self.slab.destroy_all(device)` at the end — never a per-image
+-        // `vkFreeMemory` (that would double-free a block many images share).
++        // Sampled and snapshot images are slab-backed. Target/recycle/registry
++        // images may instead carry dedicated attachment memory, so those drains
++        // use the same release owner as hot retirement. Imported registry parents
++        // remain with host_ram_imports; shared slab blocks are never raw-freed.
+         for s in self.sampled_free.drain() {
+             device.destroy_image_view(s.view, None);
+             device.destroy_image(s.image, None);
+@@ -139,8 +139,15 @@
+             device.destroy_image(s.image, None);
+         }
+         for img in self.target_free.drain() {
++            #[cfg(test)]
++            eprintln!(
++                "PARENT_RECYCLED_TARGET_TERMINAL image={:#x} memory={:#x}",
++                img.image.as_raw(),
++                img.memory.as_raw()
++            );
+             device.destroy_image_view(img.view, None);
+             device.destroy_image(img.image, None);
++            release_image_backing(device, &mut self.slab, img.image, img.memory);
+         }
+         for s in self.sampled_live.drain(..) {
+             device.destroy_image_view(s.view, None);
+@@ -179,12 +186,14 @@
+             device.destroy_framebuffer(t.framebuffer, None);
+             device.destroy_image_view(t.view, None);
+             device.destroy_image(t.image, None);
++            release_image_backing(device, &mut self.slab, t.image, t.memory);
+         }
+         self.target_order.clear();
+         if let Some(t) = self.multisample_target.take() {
+             device.destroy_framebuffer(t.framebuffer, None);
+             device.destroy_image_view(t.view, None);
+             device.destroy_image(t.image, None);
++            release_image_backing(device, &mut self.slab, t.image, t.memory);
+         }
+         // The wholesale half of the window's licence, in the same statement as
+         // the destruction it answers for.
+@@ -198,12 +207,23 @@
+         // destruction can reach it without passing this.
+         self.invalidate_window_sources();
+         for (_, t) in self.registry.drain() {
++            #[cfg(test)]
++            if let ResidentMemory::Recyclable(memory) = &t.memory {
++                eprintln!(
++                    "PARENT_REGISTRY_TERMINAL image={:#x} memory={:#x}",
++                    t.image.as_raw(),
++                    memory.as_raw()
++                );
++            }
+             device.destroy_framebuffer(t.framebuffer, None);
+             for (_, view) in t.alternate_views {
+                 device.destroy_image_view(view, None);
+             }
+             device.destroy_image_view(t.view, None);
+             device.destroy_image(t.image, None);
++            if let ResidentMemory::Recyclable(memory) = t.memory {
++                release_image_backing(device, &mut self.slab, t.image, memory);
++            }
+         }
+         self.registry_order.clear();
+         // Every fence above was waited, so nothing can still be reading or
+--- r3/crates/reims-vgpu/src/backend/vulkan/engine/host_ram.rs
++++ qualification/crates/reims-vgpu/src/backend/vulkan/engine/host_ram.rs
+@@ -69,6 +69,8 @@
+         unsafe {
+             device.destroy_buffer(self.buffer, None);
+             device.free_memory(self.memory, None);
++            #[cfg(test)]
++            eprintln!("PARENT_IMPORTED_PARENT_FREE memory={:#x} owner=host_ram_imports", ash::vk::Handle::as_raw(self.memory));
+         }
+         if let Some(alias) = self.alias {
+             super::release_host_alias(alias);
+@@ -570,6 +572,8 @@
+             .push_next(&mut host_import);
+         let memory = unsafe { ctx.device.allocate_memory(&allocate, None) }
+             .map_err(|result| HostRamDecline::AllocateMemory { result })?;
++        #[cfg(test)]
++        eprintln!("PARENT_IMPORTED_PARENT_ALLOC memory={:#x} bytes={} owner=host_ram_imports", ash::vk::Handle::as_raw(memory), size);
+ 
+         match unsafe { ctx.device.bind_buffer_memory(buffer, memory, 0) } {
+             Ok(()) => Ok(ImportedHostRam {
+--- r3/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
++++ qualification/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+@@ -6674,3 +6674,8 @@
+ #[cfg(test)]
+ #[path = "r3-qualification.rs"]
+ mod r3_qualification;
++
++// Memory-release qualification only.
++#[cfg(test)]
++#[path = "mrt-release-controls.rs"]
++mod mrt_release_validation;
+--- r3/crates/reims-vgpu/src/backend/vulkan/engine/mrt-release-controls.rs
++++ qualification/crates/reims-vgpu/src/backend/vulkan/engine/mrt-release-controls.rs
+@@ -0,0 +1,134 @@
++// Qualification-only native ownership controls. Included solely under cfg(test).
++use super::*;
++use super::context::DeviceContext;
++use ash::vk::{self, Handle};
++use std::sync::Arc;
++use std::path::PathBuf;
++include!("r3-pixel-helpers.rs");
++
++fn maps() {
++    let text=std::fs::read_to_string("/proc/self/maps").unwrap();
++    assert!(text.contains("libVkLayer_khronos_validation.so"));
++    for l in text.lines().filter(|l|l.contains("/bundle/")||l.contains("/soft/")){eprintln!("MEMORY_ACTUAL_MAP {l}");}
++    eprintln!("MEMORY_ACTIVE_SETTINGS {}",std::fs::read_to_string("/validation/vk_layer_settings.txt").unwrap());
++}
++fn memory(pools:&ResourcePools,id:&TargetIdentity)->(u64,u64){
++    let slot=pools.registry_get(id).expect("actual resident remains owned");
++    let pools::ResidentMemory::Recyclable(memory)=slot.memory else {panic!("owned allocation required")};
++    (slot.image.as_raw(),memory.as_raw())
++}
++fn req(id:u64)->DrawRequest {
++    let mut r=DrawRequest{vert_spirv:Arc::new(mrt_order_words("fetch.vert.spv")),frag_spirv:Arc::new(mrt_order_words("r3-primary.frag.spv")),width:20,height:20,vertex_count:3,first_vertex:0,instance_count:Some(1),base_instance:0,primitive_topology:PrimitiveTopology(reims_vgpu_core::topology::PrimitiveType::Triangle),..Default::default()};
++    r.target_identity=Some(mrt_order_identity(id));
++    r.color_attachment=Some(crate::backend::vulkan::translate::pixel::color_attachment(crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM).unwrap().0.with_clear([0.2,0.4,0.6,1.0]));
++    r.target_rgba8=Some(Arc::new([51,102,153,255].repeat(400)));r.color_input=ColorInputs::parse([0]).unwrap();
++    r.scissors.push(ScissorResource{x:2,y:2,width:16,height:16});r
++}
++fn pixels(label:&str,out:DrawOutput){
++    let mut bytes=out.pixels;if out.pixels_bgra{for p in bytes.chunks_exact_mut(4){p.swap(0,2)}}
++    mrt_order_pixels(label,&bytes,[0.15,0.25,0.35,1.0],[0.2,0.4,0.6,1.0]);
++}
++fn destroy_engine(state:&crate::model::DeviceState){
++    device_caches(state).unwrap().with(|caches|{
++        let mut g=lock_engine();let mut ctx=g.owner.ctx.take().unwrap();ctx.queue_wait_idle().unwrap();
++        unsafe{caches.destroy_all(&ctx.device);g.pools.destroy_all(&ctx.device);eprintln!("MEMORY_DEVICE_DESTROY_BEGIN");ctx.destroy();eprintln!("MEMORY_DEVICE_DESTROY_COMPLETE");}
++        *caches=ObjectCaches::new();g.pools=ResourcePools::new();g.owner=ContextOwner::new();
++    });
++}
++
++#[test]
++fn memory_release_actual_control(){
++    crate::observe::redirect_logs_for_tests();
++    let case=std::env::var("MRT_MEMORY_CONTROL").unwrap();eprintln!("MEMORY_CONTROL_BEGIN case={case}");
++    if case=="dedicated-live"||case=="dedicated-retired" {
++        let mut ctx=unsafe{DeviceContext::create()}.expect("actual device");
++        let counters=EngineCounters::default();let mut pools=ResourcePools::new();
++        let id=TargetIdentity::Texture{ref_:0xfe01,width:20,height:20,generation:1,stencil:false};
++        unsafe{pools.registry_ensure_depth(&ctx,id.clone(),20,20,1,false,&counters)}.unwrap();
++        let (image,memory)=memory(&pools,&id);eprintln!("MEMORY_CONTROL_OWNED case={case} image={image:#x} memory={memory:#x} expected_owner=dedicated site=depth_resident");
++        if case=="dedicated-retired" {
++            assert!(unsafe{pools.memory_release_validation_retire(&ctx,&id,&counters)});
++            assert!(pools.registry_get(&id).is_none());
++            eprintln!("MEMORY_CONTROL_RETIRED image={image:#x} memory={memory:#x}");
++        } else {assert!(pools.registry_get(&id).is_some());}
++        maps();ctx.queue_wait_idle().unwrap();
++        unsafe{pools.destroy_all(&ctx.device);eprintln!("MEMORY_DEVICE_DESTROY_BEGIN");ctx.destroy();eprintln!("MEMORY_DEVICE_DESTROY_COMPLETE");}
++    } else if case=="shared-slab" {
++        let state=crate::model::DeviceState::new(crate::model::DeviceId(1),reims_vgpu_protocol::gva::PAGE_SHIFT_X86);
++        let a=req(0xfe11);let b=req(0xfe12);
++        pixels("memory-shared-first",execute_draw_request(&state,&a).unwrap());pixels("memory-shared-second",execute_draw_request(&state,&b).unwrap());
++        {
++            let mut g=lock_engine();let one=memory(&g.pools,a.target_identity.as_ref().unwrap());let two=memory(&g.pools,b.target_identity.as_ref().unwrap());
++            assert_ne!(one.0,two.0);assert_eq!(one.1,two.1,"two actual primary images must share one actual slab block");
++            eprintln!("MEMORY_CONTROL_SHARED first_image={:#x} second_image={:#x} memory={:#x}",one.0,two.0,one.1);
++            let ctx=g.owner.ctx.take().unwrap();ctx.queue_wait_idle().unwrap();
++            let id=a.target_identity.as_ref().unwrap();
++            let counters=EngineCounters::default();assert!(unsafe{g.pools.memory_release_validation_retire(&ctx,id,&counters)});assert!(g.pools.registry_get(id).is_none());
++            assert_eq!(memory(&g.pools,b.target_identity.as_ref().unwrap()),two);g.owner.ctx=Some(ctx);
++        }
++        // Reuse the surviving allocation after its neighbour retired. API validation
++        // and exact pixels witness that a shared block was not prematurely freed.
++        pixels("memory-shared-survivor",execute_draw_request(&state,&b).unwrap());
++        maps();destroy_engine(&state);
++    } else if case=="imported-parent" {
++        let state=crate::model::DeviceState::new(crate::model::DeviceId(1),reims_vgpu_protocol::gva::PAGE_SHIFT_X86);
++        let warm=req(0xfe31);pixels("memory-import-warm",execute_draw_request(&state,&warm).unwrap());
++        let mut owned=None;
++        {
++            let mut g=lock_engine();let ctx=g.owner.ctx.take().unwrap();ctx.queue_wait_idle().unwrap();
++            eprintln!("MEMORY_IMPORT_CAPS topology={:?} host_pointer={:?}",ctx.caps.memory.topology,ctx.caps.host_pointer.rung);
++            if ctx.caps.memory.topology!=crate::backend::vulkan::caps::memory_topology::MemoryTopology::Unified||ctx.external_memory_host.is_none(){
++                eprintln!("MEMORY_IMPORT_UNSUPPORTED topology={:?} host_pointer={:?}",ctx.caps.memory.topology,ctx.caps.host_pointer.rung);
++            }else{
++                let format=vk::Format::R8G8B8A8_UNORM;let usage=registry_target_usage(format);
++                match unsafe{ctx.instance.get_physical_device_image_format_properties(ctx.pd,format,vk::ImageType::TYPE_2D,vk::ImageTiling::LINEAR,usage,vk::ImageCreateFlags::ALIAS)}{
++                    Err(reason)=>eprintln!("MEMORY_IMPORT_UNSUPPORTED linear_format_properties={reason:?}"),
++                    Ok(_)=>{
++                        let image=unsafe{ctx.device.create_image(&vk::ImageCreateInfo::default().flags(vk::ImageCreateFlags::ALIAS).image_type(vk::ImageType::TYPE_2D).format(format).extent(vk::Extent3D{width:20,height:20,depth:1}).mip_levels(1).array_layers(1).samples(vk::SampleCountFlags::TYPE_1).tiling(vk::ImageTiling::LINEAR).usage(usage).initial_layout(vk::ImageLayout::UNDEFINED),None)}.unwrap();
++                        let layout=unsafe{ctx.device.get_image_subresource_layout(image,vk::ImageSubresource{aspect_mask:vk::ImageAspectFlags::COLOR,mip_level:0,array_layer:0})};
++                        let required=unsafe{ctx.device.get_image_memory_requirements(image)};unsafe{ctx.device.destroy_image(image,None)};
++                        let alignment=ctx.caps.host_pointer.min_alignment.max(4096) as usize;
++                        let size=(required.size.max(layout.offset+layout.row_pitch*20) as usize).next_multiple_of(alignment);
++                        let allocation=std::alloc::Layout::from_size_align(size,alignment).unwrap();let pointer=unsafe{std::alloc::alloc_zeroed(allocation)};assert!(!pointer.is_null());owned=Some((pointer,allocation));
++                        let import=Arc::new(crate::runtime::guest_ram::GuestRamImport::new_host_allocation(pointer as usize,size as u64,alignment as u64).unwrap());
++                        let backing=GuestTargetBacking{allocation_host_ptr:pointer as usize,allocation_len:size as u64,plane_offset:layout.offset,row_pitch:layout.row_pitch};
++                        let admission=unsafe{linear_target_import::create(&ctx,g.pools.memory_release_validation_imports(),&import,backing,20,20,format,usage)};
++                        match admission{
++                            Err(reason)=>eprintln!("MEMORY_IMPORT_UNSUPPORTED exact_factory_refusal={} detail={reason:?}",reason.slug()),
++                            Ok(child)=>{
++                                let parent=unsafe{g.pools.memory_release_validation_imports().allocation(&ctx,&import)}.unwrap();
++                                eprintln!("MEMORY_IMPORT_ADMITTED image={:#x} memory={:#x} bytes={} row_pitch={} plane_offset={}",child.image.as_raw(),parent.memory.as_raw(),size,layout.row_pitch,layout.offset);
++                                unsafe{ctx.device.destroy_image(child.image,None)};
++                                assert!(g.pools.memory_release_validation_imports().release_child(&import).is_none());
++                                let slot=g.pools.registry_get(warm.target_identity.as_ref().unwrap()).unwrap();let pass=slot.render_pass;let compatibility=slot.framebuffer_compatibility.unwrap();
++                                let guest=GuestTargetMemory{backing,import:Arc::clone(&import),footprint:crate::runtime::guest_ram::GuestPageFootprint::new(Arc::from((0..size/4096).map(|i|0x1000+(i*4096) as u64).collect::<Vec<_>>()),4096).unwrap()};
++                                let counters=EngineCounters::default();let id=mrt_order_identity(0xfe32);
++                                let (slot,_)=unsafe{g.pools.registry_ensure(&ctx,id,20,20,1,pass,compatibility,1,format,Some(guest),&counters)}.unwrap();
++                                assert!(slot.memory.is_guest_imported());
++                                eprintln!("MEMORY_IMPORTED_REGISTRY_CONTROL image={:#x} memory={:#x} expected_owner=host_ram_imports",slot.image.as_raw(),parent.memory.as_raw());
++                            }
++                        }
++                    }
++                }
++            }
++            g.owner.ctx=Some(ctx);
++        }
++        maps();destroy_engine(&state);
++        if let Some((pointer,allocation))=owned{
++            let released=take_released_host_aliases();assert!(released.is_empty()||released==vec![(pointer as usize,allocation.size())],"one allocator terminal alias release");
++            unsafe{std::alloc::dealloc(pointer,allocation)};
++        }
++    } else if case=="resident-depth-retention"||case=="normal-depth-off" {
++        let state=crate::model::DeviceState::new(crate::model::DeviceId(1),reims_vgpu_protocol::gva::PAGE_SHIFT_X86);
++        let mut r=req(0xfe21);let id=TargetIdentity::Texture{ref_:0xfe22,width:20,height:20,generation:1,stencil:false};
++        r.depth=Some(DepthState{identity:Some(id.clone()),test_enable:true,write_enable:true,compare:SamplerCompareFunction::Always,clear_value:1.0,load:false,stencil:None});
++        if case=="resident-depth-retention" {
++            assert_eq!(std::env::var("REIMS_VGPU_PASS_CHURN").unwrap(),"on");
++            let error=execute_draw_request(&state,&r).expect_err("typed refusal before draw");
++            assert!(matches!(error,DrawError::Unsupported(reason::DrawReason::ProbeScope(caches::ProbeScopeDecline::PassChurn{..}))));
++            let g=lock_engine();let (image,memory)=memory(&g.pools,&id);eprintln!("MEMORY_RESIDENT_DEPTH_RETAINED image={image:#x} memory={memory:#x}");
++        }else{assert!(std::env::var("REIMS_VGPU_PASS_CHURN").is_err());pixels("memory-normal-depth-off",execute_draw_request(&state,&r).unwrap());}
++        maps();destroy_engine(&state);
++    }else{panic!("unknown memory ownership control {case}")}
++    eprintln!("MEMORY_CONTROL_COMPLETE case={case}");
++}
+--- r3/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
++++ qualification/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
+@@ -5418,3 +5418,10 @@
+         );
+     }
+ }
++
++// Test-only access to the real parent-allocation ledger; no policy override.
++#[cfg(test)]
++impl ResourcePools {
++    pub(in crate::backend::vulkan::engine) fn memory_release_validation_imports(&mut self) -> &mut super::super::host_ram::HostRamImports { &mut self.host_ram_imports }
++    pub(in crate::backend::vulkan::engine) unsafe fn memory_release_validation_retire(&mut self, ctx: &DeviceContext, id: &TargetIdentity, counters: &EngineCounters) -> bool { unsafe { self.retire_resident(ctx, id, ResidentReclaim::Recreated, counters) }.is_some() }
++}
+--- r3/crates/reims-vgpu/src/backend/vulkan/engine/slab.rs
++++ qualification/crates/reims-vgpu/src/backend/vulkan/engine/slab.rs
+@@ -651,6 +651,8 @@
+         if empty && (dedicated || self.empty_spares(small) > SLAB_KEEP_EMPTY) {
+             if let Some(b) = self.blocks[idx].take() {
+                 device.free_memory(b.memory, None);
++            #[cfg(test)]
++            eprintln!("PARENT_SLAB_RAW_MEMORY_FREE memory={:#x} owner=slab", ash::vk::Handle::as_raw(b.memory));
+                 self.block_frees += 1;
+                 crate::observe::off(format!(
+                     "slab_block ev=free block_allocs={} block_frees={} sub_allocs={} live={}",
+@@ -687,6 +689,8 @@
+         for idx in victims {
+             if let Some(b) = self.blocks[idx].take() {
+                 device.free_memory(b.memory, None);
++            #[cfg(test)]
++            eprintln!("PARENT_SLAB_RAW_MEMORY_FREE memory={:#x} owner=slab", ash::vk::Handle::as_raw(b.memory));
+                 self.block_frees += 1;
+                 freed += 1;
+             }
+@@ -770,6 +774,8 @@
+     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+         for b in self.blocks.drain(..).flatten() {
+             device.free_memory(b.memory, None);
++            #[cfg(test)]
++            eprintln!("PARENT_SLAB_RAW_MEMORY_FREE memory={:#x} owner=slab", ash::vk::Handle::as_raw(b.memory));
+         }
+         self.live.clear();
+         self.granularity = 0;

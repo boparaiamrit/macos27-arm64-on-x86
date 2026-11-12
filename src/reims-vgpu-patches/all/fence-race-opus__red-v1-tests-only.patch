@@ -1,0 +1,200 @@
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs
+@@ -7313,3 +7313,145 @@
+         assert_eq!(pools.attachment_snapshot_free.total, expected);
+     }
+ }
++
++/// A ring fence is the queue owner's until the owner is back from the
++/// `vkQueueSubmit` that took it.
++///
++/// A batch leaves the drain worker at the handoff, before that call has even
++/// started, and Vulkan makes the submitted fence externally synchronized for
++/// the call's whole length. A drain-side wait that starts first is what the R8
++/// qualification's `held-open-off` case caught: `vkQueueSubmit(): THREADING
++/// ERROR : object of type VkFence is simultaneously used in current thread …`,
++/// the owner submitting a fence the joined readback was already waiting on.
++///
++/// The owner is parked behind a hold so the order is not left to the
++/// scheduler: the handoff sits in its FIFO while the drain side reaches the
++/// fence, and a third thread releases the hold. A ring that waits early is
++/// reported by the Khronos threading layer on every run; the assertions below
++/// are what holds on any host once it does not.
++#[cfg(test)]
++mod ring_fence_handoff_tests {
++    use super::*;
++    use crate::backend::vulkan::engine::queue_owner::OwnerHold;
++
++    /// Long enough that the drain side is certainly inside its wait first.
++    const RELEASE_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
++
++    /// Open a one-entry batch the way a deferred draw does: claim the slot,
++    /// begin it, append.
++    unsafe fn open_batch(
++        ctx: &DeviceContext,
++        pools: &mut ResourcePools,
++        counters: &EngineCounters,
++    ) -> vk::Fence {
++        let slot = unsafe { pools.begin_entry(ctx, counters) }.expect("ring slot");
++        unsafe {
++            pools.begin_slot_recording(
++                ctx,
++                slot.0,
++                gpu_span::Kind::Draw,
++                VkOp::ExecResetCb,
++                VkOp::ExecBeginCb,
++            )
++        }
++        .expect("recording batch");
++        let target = BatchTarget {
++            identity: TargetIdentity::Gva {
++                gva: 0xfe0000,
++                width: 4,
++                height: 4,
++                generation: 1,
++                format: vk::Format::R8G8B8A8_UNORM,
++            },
++            width: 4,
++            height: 4,
++            bgra: false,
++        };
++        unsafe { pools.batch_append(&ctx.device, slot, target, None, Vec::new(), counters) };
++        slot.1
++    }
++
++    fn release_later(hold: OwnerHold) -> std::thread::JoinHandle<()> {
++        std::thread::spawn(move || {
++            std::thread::sleep(RELEASE_AFTER);
++            drop(hold);
++        })
++    }
++
++    fn async_submits_returned(ctx: &DeviceContext) -> u64 {
++        ctx.queue_owner
++            .as_ref()
++            .expect("these tests are about the queue owner")
++            .stats()
++            .0
++    }
++
++    /// The readback that joins an open batch hands it off and waits its fence
++    /// at once — `copy_image_level0_to_host_delivered`'s `batch_flush` then
++    /// `wait_entry_fence`. That wait may begin only once the owner is back.
++    #[test]
++    fn a_joined_readback_waits_its_batch_fence_only_after_the_owner_returns() {
++        crate::observe::redirect_logs_for_tests();
++        let mut ctx = match unsafe { DeviceContext::create() } {
++            Ok(c) => c,
++            Err(e) => {
++                eprintln!("SKIP ring fence handoff: no device ({e})");
++                return;
++            }
++        };
++        let counters = EngineCounters::default();
++        let mut pools = ResourcePools::new();
++        unsafe { pools.ensure_init(&ctx, &counters) }.expect("ring");
++        let fence = unsafe { open_batch(&ctx, &mut pools, &counters) };
++
++        let hold = ctx.queue_owner.as_ref().expect("queue owner").hold();
++        unsafe { pools.batch_flush(&ctx, &counters) }.expect("handoff");
++        let release = release_later(hold);
++        unsafe { pools.wait_entry_fence(&ctx, &counters, fence) }
++            .expect("the batch completes once the owner submits it");
++        assert_eq!(
++            async_submits_returned(&ctx),
++            1,
++            "the batch fence was waited before the owner was back from vkQueueSubmit"
++        );
++        release.join().expect("release thread");
++
++        ctx.queue_wait_idle().expect("quiesce before owned destruction");
++        unsafe { pools.destroy_all(&ctx.device) };
++        unsafe { ctx.destroy() };
++    }
++
++    /// The quiesce every completion stamp runs hands the open batch off and
++    /// then waits and resets every pending fence — the batch's included.
++    #[test]
++    fn retiring_a_handed_off_batch_waits_for_the_owner_to_return() {
++        crate::observe::redirect_logs_for_tests();
++        let mut ctx = match unsafe { DeviceContext::create() } {
++            Ok(c) => c,
++            Err(e) => {
++                eprintln!("SKIP ring fence handoff: no device ({e})");
++                return;
++            }
++        };
++        let counters = EngineCounters::default();
++        let mut pools = ResourcePools::new();
++        unsafe { pools.ensure_init(&ctx, &counters) }.expect("ring");
++        unsafe { open_batch(&ctx, &mut pools, &counters) };
++
++        let hold = ctx.queue_owner.as_ref().expect("queue owner").hold();
++        let release = release_later(hold);
++        unsafe { pools.retire_all(&ctx, &counters) }
++            .expect("the ring retires once the owner submits the batch");
++        assert_eq!(
++            async_submits_returned(&ctx),
++            1,
++            "a slot fence was waited before the owner was back from vkQueueSubmit"
++        );
++        assert_eq!(pools.in_flight, 0, "the handed-off batch retired");
++        release.join().expect("release thread");
++
++        ctx.queue_wait_idle().expect("quiesce before owned destruction");
++        unsafe { pools.destroy_all(&ctx.device) };
++        unsafe { ctx.destroy() };
++    }
++}
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/queue_owner.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/queue_owner.rs
+@@ -69,6 +69,10 @@
+     Barrier {
+         reply: Reply,
+     },
++    /// Test seam: park the owner at this point of its FIFO until the matching
++    /// [`OwnerHold`] is dropped.
++    #[cfg(test)]
++    Hold(mpsc::Receiver<()>),
+     Stop,
+ }
+ 
+@@ -326,6 +330,27 @@
+         if let Some(join) = self.join.take() {
+             let _ = join.join();
+         }
++    }
++}
++
++/// Test seam returned by [`QueueOwner::hold`]: the owner thread stays parked
++/// where the hold entered its FIFO until this is dropped.
++#[cfg(test)]
++pub(crate) struct OwnerHold {
++    _release: mpsc::SyncSender<()>,
++}
++
++#[cfg(test)]
++impl QueueOwner {
++    /// Park the owner behind everything sent so far, so a test can decide when
++    /// a later submission reaches the driver instead of leaving it to the
++    /// scheduler.
++    pub(crate) fn hold(&self) -> OwnerHold {
++        let (release, parked) = mpsc::sync_channel(0);
++        self.sender
++            .send(Request::Hold(parked))
++            .expect("the queue owner is running");
++        OwnerHold { _release: release }
+     }
+ }
+ 
+@@ -418,6 +443,10 @@
+             Request::Barrier { reply } => {
+                 let _ = reply.send(Ok(QueueOutcome::Unit));
+             }
++            #[cfg(test)]
++            Request::Hold(parked) => {
++                let _ = parked.recv();
++            }
+             Request::Stop => return,
+         }
+     }

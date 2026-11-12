@@ -1,0 +1,288 @@
+--- frozen/vulkan.rs
++++ qualified/vulkan.rs
+@@ -1166,10 +1166,7 @@
+             reason.slug(),
+         ));
+     };
+-    let plan = match NativeBufferTexture::resolve(
+-        bt,
+-        crate::backend::vulkan::engine::supports_sampled_layout_bind,
+-    ) {
++    let plan = match NativeBufferTexture::resolve(bt, buffer_texture_sampled_layout_supported) {
+         Ok(Some(plan)) => plan,
+         Ok(None) => {
+             let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, bt)?;
+@@ -14962,3 +14959,39 @@
+         );
+     }
+ }
++
++// Qualification-only injection at the capability door. Non-test builds always
++// query the real engine; no memory, debt, source-read or settle API is replaced.
++fn buffer_texture_sampled_layout_supported(layout: TexelLayout) -> bool {
++    #[cfg(test)]
++    if let Some(answer) = TEST_BUFFER_TEXTURE_CAPABILITY.with(|value| value.get()) {
++        return answer;
++    }
++    crate::backend::vulkan::engine::supports_sampled_layout_bind(layout)
++}
++
++#[cfg(test)]
++thread_local! {
++    static TEST_BUFFER_TEXTURE_CAPABILITY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
++}
++
++#[cfg(test)]
++struct TestBufferTextureCapability(Option<bool>);
++
++#[cfg(test)]
++impl TestBufferTextureCapability {
++    fn set(answer: bool) -> Self {
++        Self(TEST_BUFFER_TEXTURE_CAPABILITY.with(|value| value.replace(Some(answer))))
++    }
++}
++
++#[cfg(test)]
++impl Drop for TestBufferTextureCapability {
++    fn drop(&mut self) {
++        TEST_BUFFER_TEXTURE_CAPABILITY.with(|value| value.set(self.0));
++    }
++}
++
++#[cfg(test)]
++#[path = "rgb10_runtime_tests.rs"]
++mod rgb10_runtime_tests;
+--- /dev/null
++++ qualified/rgb10_runtime_tests.rs
+@@ -0,0 +1,231 @@
++//! Actual runtime integration, using the existing paged-memory and debt fixtures.
++use super::*;
++use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
++use crate::protocol::endian::{st32, st64};
++use crate::runtime::decode::resource::{
++    list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,
++};
++use crate::runtime::gva_mem::{define_task_pages_arm64e, write_task_gva_arm64e};
++use crate::runtime::host::FakeHost;
++use crate::runtime::writeback_debt::test_resident_identity;
++
++const W: usize = 106;
++const H: usize = 106;
++const PITCH: usize = 512;
++const OFFSET: usize = 64;
++const SPAN: usize = (H - 1) * PITCH + W * 4;
++const ALLOC: usize = OFFSET + PITCH * H + 64;
++const GVA: u64 = 5 << RESOURCE_PAGE_SHIFT;
++
++struct Rig {
++    state: DeviceState,
++    host: FakeHost,
++    bt: BufferTextureDescriptor,
++    source: Vec<u8>,
++    expected: Vec<u8>,
++}
++
++impl Rig {
++    fn new(allocation: usize) -> Self {
++        let mut host = FakeHost::new();
++        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++        define_task_pages_arm64e(&mut host, &mut state, 4, 12);
++        assert!(state.set_object_list(1, 0, 64));
++        let mut source = vec![0xA7; ALLOC];
++        let mut expected = Vec::with_capacity(W * H * 4);
++        for y in 0..H {
++            for x in 0..W {
++                // Adjacent R=1,2; unequal G/B; A alternates 1,3.
++                let word = (1 + (x % 2) as u32)
++                    | (((37 + y * 3) as u32 & 1023) << 10)
++                    | (((701 + x) as u32 & 1023) << 20)
++                    | ((if x % 2 == 0 { 1u32 } else { 3u32 }) << 30);
++                let p = OFFSET + y * PITCH + x * 4;
++                source[p..p + 4].copy_from_slice(&word.to_le_bytes());
++                expected.extend_from_slice(&word.to_le_bytes());
++            }
++        }
++        write_task_gva_arm64e(&mut host, &state.tasks[1], GVA, &source);
++        let mut bdesc = [0u8; 16];
++        st64(&mut bdesc, allocation as u64);
++        st32(&mut bdesc[8..], 5);
++        write_task_gva_arm64e(&mut host, &state.tasks[1], 0x1000, &bdesc);
++        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
++        st32(&mut entry, u32::from(OBJECT_TYPE_BUFFER) | (16 << 8));
++        st64(&mut entry[4..], 0x1000);
++        write_task_gva_arm64e(
++            &mut host,
++            &state.tasks[1],
++            list_object_entry_offset(32, 64).unwrap(),
++            &entry,
++        );
++        let bt = BufferTextureDescriptor {
++            new_texture_ref: 31,
++            buffer_ref: 32,
++            offset: OFFSET as u64,
++            bytes_per_row: PITCH as u64,
++            desc: crate::runtime::heap_query::TextureDescriptor {
++                texture_type: 2,
++                framebuffer_only: false,
++                is_drawable: false,
++                allow_gpu_optimized_contents: false,
++                usage: 1,
++                pixel_format: pixel_format::MTL_FORMAT_RGB10A2_UNORM,
++                width: W as u32,
++                height: H as u32,
++                depth: 1,
++                mipmap_level_count: 1,
++                sample_count: 1,
++                array_length: 1,
++                resource_options: 0,
++                protection_options: 0,
++                swizzle: None,
++            },
++        };
++        Self {
++            state,
++            host,
++            bt,
++            source,
++            expected,
++        }
++    }
++
++    fn load(&mut self) -> Option<(u32, u32, Vec<u8>, SampledByteFormat)> {
++        load_buffer_texture_upload(&mut self.state, &mut self.host, 1, 31, &self.bt)
++    }
++
++    fn arm(&mut self, id: u32) {
++        assert_eq!(
++            self.state
++                .pending_writebacks
++                .arm(id, test_resident_identity(id, 32, 32, 1), 32, 32, 1,),
++            None
++        );
++    }
++
++    fn source_now(&self) -> Vec<u8> {
++        let mut bytes = vec![0; ALLOC];
++        gva_mem::read_task_gva_by_id(
++            &self.host,
++            &self.state.tasks,
++            1,
++            GVA,
++            &mut bytes,
++            PAGE_SHIFT_ARM64E,
++        )
++        .unwrap();
++        bytes
++    }
++}
++
++#[test]
++fn rgb10_actual_runtime_native_bytes_and_ownership() {
++    let _cap = TestBufferTextureCapability::set(true);
++    let mut rig = Rig::new(ALLOC);
++    let saved = crate::runtime::drain::store_route_count("cpu_buffer_extent_saved_bytes");
++    let (w, h, bytes, format) = rig.load().expect("actual loader must accept RGB10A2");
++    assert_eq!((w, h), (W as u32, H as u32));
++    assert_eq!(
++        format,
++        SampledByteFormat::from_source(TexelLayout::Rgb10a2Unorm, 0x5a)
++    );
++    assert_eq!(bytes, rig.expected);
++    assert_eq!(
++        rig.source_now(),
++        rig.source,
++        "prefix, padding and tail remain unchanged"
++    );
++    assert_eq!(
++        crate::runtime::drain::store_route_count("cpu_buffer_extent_saved_bytes") - saved,
++        (ALLOC - OFFSET - SPAN) as u64,
++        "actual buffer reader uses the last tight row span"
++    );
++    // Emit the ACTUAL runtime result, not the fixture's independently authored expected bytes.
++    std::fs::write("/out/runtime-native.bin", &bytes).unwrap();
++    std::fs::write("/out/runtime-source-before.bin", &rig.source).unwrap();
++    std::fs::write("/out/runtime-source-after.bin", rig.source_now()).unwrap();
++    std::fs::write("/out/runtime-geometry.json", format!(
++        "{{\"width\":{W},\"height\":{H},\"source_pitch\":{PITCH},\"source_offset\":{OFFSET},\"read_span\":{SPAN},\"allocation\":{ALLOC},\"native_bytes\":{},\"format\":\"A2B10G10R10_UNORM_PACK32\",\"producer\":\"actual load_buffer_texture_upload\"}}\n", bytes.len()
++    )).unwrap();
++    write_task_gva_arm64e(&mut rig.host, &rig.state.tasks[1], GVA, &vec![0xD9; ALLOC]);
++    assert_eq!(
++        bytes, rig.expected,
++        "upload owns bytes after guest storage is overwritten"
++    );
++    assert_ne!(rig.source_now(), rig.source);
++}
++
++#[test]
++fn rgb10_actual_runtime_short_allocation_refuses_without_buffer_payment() {
++    let _cap = TestBufferTextureCapability::set(true);
++    let mut rig = Rig::new(OFFSET + SPAN - 1);
++    rig.arm(31);
++    rig.arm(32);
++    let capture = crate::observe::FailCapture::start();
++    assert!(rig.load().is_none());
++    assert!(capture
++        .lines()
++        .iter()
++        .any(|x| x.contains("reason=buftex_native_source_range")));
++    assert!(
++        rig.state.pending_writebacks.get(31).is_none(),
++        "texture obligation precedes backing refusal"
++    );
++    assert!(
++        rig.state.pending_writebacks.get(32).is_some(),
++        "invalid allocation never reaches source reader"
++    );
++    assert_eq!(rig.source_now(), rig.source);
++}
++
++#[test]
++fn rgb10_actual_runtime_capability_refusal_has_no_fallback_or_read() {
++    let _cap = TestBufferTextureCapability::set(false);
++    let mut rig = Rig::new(ALLOC);
++    rig.arm(31);
++    rig.arm(32);
++    let capture = crate::observe::FailCapture::start();
++    assert!(rig.load().is_none());
++    assert!(capture
++        .lines()
++        .iter()
++        .any(|x| x.contains("reason=buftex_native_host_sampled_layout")));
++    assert!(rig.state.pending_writebacks.get(31).is_some());
++    assert!(rig.state.pending_writebacks.get(32).is_some());
++    assert_eq!(rig.source_now(), rig.source);
++}
++
++#[test]
++fn rgb10_actual_runtime_consults_both_debts_and_real_source_census() {
++    let _cap = TestBufferTextureCapability::set(true);
++    let count = crate::runtime::drain::store_route_count;
++    let before = count("wbdebt_generation_moved");
++    let census = count("wbdebt_reach_disjoint");
++    // The existing census samples 1/64 calls. Real unrelated debt keeps it active.
++    for _ in 0..64 {
++        let mut rig = Rig::new(ALLOC);
++        rig.arm(31);
++        rig.arm(32);
++        rig.arm(63);
++        assert!(!crate::backend::vulkan::engine::guest_writes_outstanding());
++        assert_eq!(rig.load().unwrap().2, rig.expected);
++        assert!(rig.state.pending_writebacks.get(31).is_none());
++        assert!(rig.state.pending_writebacks.get(32).is_none());
++        assert!(
++            rig.state.pending_writebacks.get(63).is_some(),
++            "unrelated debt remains owned"
++        );
++        assert!(!crate::backend::vulkan::engine::guest_writes_outstanding());
++    }
++    assert_eq!(
++        count("wbdebt_generation_moved") - before,
++        128,
++        "actual payments take both named debts; absent mapping declines landing"
++    );
++    assert_eq!(
++        count("wbdebt_reach_disjoint") - census,
++        1,
++        "actual source-read census executes"
++    );
++}

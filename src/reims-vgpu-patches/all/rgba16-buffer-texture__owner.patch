@@ -1,0 +1,323 @@
+--- a/crates/reims-vgpu/src/runtime/draw/buffer_texture.rs
++++ b/crates/reims-vgpu/src/runtime/draw/buffer_texture.rs
+@@ -1,5 +1,5 @@
+-//! Native opcode-9 storage for the packed RGB10A2 format. Other formats keep
+-//! their existing RGBA8 loader; ten-bit words never enter that converter.
++//! Native opcode-9 storage for RGB10A2 and RGBA16Unorm. Other formats keep
++//! their existing RGBA8 loader; native texels never enter that converter.
+ 
+ use crate::observe::Decline;
+ use crate::protocol::pixel_format::{self, SampledByteFormat, TexelLayout};
+@@ -44,10 +44,12 @@
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub(super) struct NativeBufferTexture {
+     level: TextureLevelLayout,
++    layout: TexelLayout,
++    source_format: u16,
+ }
+ 
+ impl NativeBufferTexture {
+-    /// `None` means this format stays on its existing loader. Once RGB10A2 has
++    /// `None` means this format stays on its existing loader. Once a native format has
+     /// selected this owner, an unsupported shape or host is a refusal, never
+     /// permission to quantize the words or reinterpret them as RGBA8.
+     pub(super) fn resolve(
+@@ -55,9 +57,12 @@
+         supports_sampled_layout: impl FnOnce(TexelLayout) -> bool,
+     ) -> Result<Option<Self>, BufferTextureRefusal> {
+         use BufferTextureRefusal as R;
+-        if bt.desc.pixel_format != pixel_format::MTL_FORMAT_RGB10A2_UNORM {
+-            return Ok(None);
+-        }
++        let source_format = bt.desc.pixel_format;
++        let layout = match source_format {
++            pixel_format::MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
++            pixel_format::MTL_FORMAT_RGBA16_UNORM => TexelLayout::Rgba16Unorm,
++            _ => return Ok(None),
++        };
+         let d = &bt.desc;
+         // SampledSourceRequest's byte source carries one 2D image. Do not
+         // invent missing planes, mips, multisamples, or a descriptor swizzle.
+@@ -73,9 +78,7 @@
+         if d.width == 0 || d.height == 0 {
+             return Err(R::ZeroGeometry);
+         }
+-        let tight = TexelLayout::Rgb10a2Unorm
+-            .tight_row_bytes(d.width)
+-            .ok_or(R::TightRowOverflow)?;
++        let tight = layout.tight_row_bytes(d.width).ok_or(R::TightRowOverflow)?;
+         let pitch = if bt.bytes_per_row == 0 {
+             u64::from(tight)
+         } else {
+@@ -97,10 +100,14 @@
+         super::host_alloc_len(level.size).ok_or(R::HostLengthOverflow)?;
+         super::host_alloc_len(u64::from(tight) * u64::from(d.height))
+             .ok_or(R::HostLengthOverflow)?;
+-        if !supports_sampled_layout(TexelLayout::Rgb10a2Unorm) {
++        if !supports_sampled_layout(layout) {
+             return Err(R::HostSampledLayout);
+         }
+-        Ok(Some(Self { level }))
++        Ok(Some(Self {
++            level,
++            layout,
++            source_format,
++        }))
+     }
+ 
+     pub(super) fn extent(self) -> (u32, u32) {
+@@ -147,9 +154,7 @@
+         }
+         // Construction checked these widths and lengths and the value is
+         // private, so no unchecked external geometry can reach this gather.
+-        let row = TexelLayout::Rgb10a2Unorm
+-            .tight_row_bytes(self.level.width)
+-            .unwrap() as usize;
++        let row = self.layout.tight_row_bytes(self.level.width).unwrap() as usize;
+         let mut bytes = vec![0; row * self.level.height as usize];
+         for y in 0..self.level.height as usize {
+             let src = y * self.level.row_stride as usize;
+@@ -157,10 +162,7 @@
+         }
+         Ok((
+             bytes,
+-            SampledByteFormat::from_source(
+-                TexelLayout::Rgb10a2Unorm,
+-                pixel_format::MTL_FORMAT_RGB10A2_UNORM,
+-            ),
++            SampledByteFormat::from_source(self.layout, self.source_format),
+         ))
+     }
+ }
+--- a/crates/reims-vgpu/src/runtime/draw/buffer_texture_tests.rs
++++ b/crates/reims-vgpu/src/runtime/draw/buffer_texture_tests.rs
+@@ -238,3 +238,229 @@
+     let names: std::collections::HashSet<_> = refusals.iter().map(Decline::slug).collect();
+     assert_eq!(names.len(), refusals.len());
+ }
++
++fn rgba16_descriptor() -> BufferTextureDescriptor {
++    let mut bt = descriptor();
++    bt.desc.pixel_format = pixel_format::MTL_FORMAT_RGBA16_UNORM;
++    bt.desc.width = 384;
++    bt.desc.height = 384;
++    bt.bytes_per_row = 3072;
++    bt
++}
++
++fn rgba16_admitted(bt: &BufferTextureDescriptor) -> NativeBufferTexture {
++    NativeBufferTexture::resolve(bt, |layout| {
++        assert_eq!(layout, TexelLayout::Rgba16Unorm);
++        true
++    })
++    .unwrap()
++    .expect("RGBA16Unorm must select its native eight-byte upload plan")
++}
++
++#[test]
++fn rgba16_buffer_texture_preserves_adjacent_codes_in_all_channels_at_384_square() {
++    let bt = rgba16_descriptor();
++    let plan = rgba16_admitted(&bt);
++    let codes: [[u16; 4]; 2] = [[1, 511, 32767, 65534], [2, 512, 32768, 65535]];
++    let mut source = Vec::with_capacity(384 * 384 * 8);
++    for i in 0..384 * 384 {
++        for code in codes[i % 2] {
++            source.extend_from_slice(&code.to_le_bytes());
++        }
++    }
++    let (upload, format) = plan.copy_rows(&source).unwrap();
++    assert_eq!(plan.extent(), (384, 384));
++    assert_eq!(plan.span(), 384 * 3072);
++    assert_eq!(upload.len(), 384 * 384 * 8);
++    assert_eq!(
++        upload, source,
++        "all sixteen bits of all four channels survive"
++    );
++    assert_eq!(
++        format,
++        SampledByteFormat::from_source(TexelLayout::Rgba16Unorm, bt.desc.pixel_format)
++    );
++    for c in 0..4 {
++        let first = u16::from_le_bytes(upload[c * 2..c * 2 + 2].try_into().unwrap());
++        let second = u16::from_le_bytes(upload[8 + c * 2..10 + c * 2].try_into().unwrap());
++        assert_eq!(first, codes[0][c]);
++        assert_eq!(
++            second,
++            first + 1,
++            "adjacent channel {c} codes must stay ordered"
++        );
++    }
++}
++
++#[test]
++fn rgba16_buffer_texture_strips_odd_row_padding_at_a_nonzero_buffer_offset() {
++    let mut bt = rgba16_descriptor();
++    bt.desc.width = 3;
++    bt.desc.height = 3;
++    bt.bytes_per_row = 32;
++    bt.offset = 29;
++    let plan = rgba16_admitted(&bt);
++    assert_eq!(plan.span(), 2 * 32 + 24);
++    let allocation = bt.offset as usize + plan.span() as usize;
++    assert_eq!(
++        plan.read_window(0x8000, allocation as u64),
++        Ok((0x801d, 88))
++    );
++    let mut source = vec![0xa7u8; allocation];
++    let mut expected = Vec::new();
++    for y in 0..3 {
++        for x in 0..3 {
++            for c in 0..4 {
++                let code: u16 = (y * 1000 + x * 20 + c + 1) as u16;
++                let encoded = code.to_le_bytes();
++                let p = bt.offset as usize + y * 32 + x * 8 + c * 2;
++                source[p..p + 2].copy_from_slice(&encoded);
++                expected.extend_from_slice(&encoded);
++            }
++        }
++    }
++    let untouched = source.clone();
++    assert_eq!(
++        plan.copy_rows(&source[bt.offset as usize..]).unwrap().0,
++        expected
++    );
++    assert_eq!(source, untouched);
++    assert_eq!(
++        plan.copy_rows(&source[bt.offset as usize..allocation - 1]),
++        Err(BufferTextureRefusal::SourceBytesShort)
++    );
++    assert_eq!(
++        plan.read_window(0x8000, allocation as u64 - 1),
++        Err(BufferTextureRefusal::SourceRange)
++    );
++}
++
++#[test]
++fn rgba16_buffer_texture_host_and_shape_refusals_do_not_fall_back_to_rgba8() {
++    let bt = rgba16_descriptor();
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| false),
++        Err(BufferTextureRefusal::HostSampledLayout)
++    );
++    for which in 0..6 {
++        let mut invalid = bt;
++        match which {
++            0 => invalid.desc.texture_type = 3,
++            1 => invalid.desc.depth = 2,
++            2 => invalid.desc.array_length = 2,
++            3 => invalid.desc.sample_count = 4,
++            4 => invalid.desc.mipmap_level_count = 5,
++            5 => invalid.desc.swizzle = Some([2, 1, 0, 3]),
++            _ => unreachable!(),
++        }
++        assert_eq!(
++            NativeBufferTexture::resolve(&invalid, |_| panic!(
++                "shape must refuse before querying host"
++            )),
++            Err(BufferTextureRefusal::UnsupportedShape)
++        );
++    }
++}
++
++#[test]
++fn rgba16_buffer_texture_checks_eight_byte_geometry_and_source_overflows() {
++    let mut bt = rgba16_descriptor();
++    let plan = rgba16_admitted(&bt);
++    let exact = bt.offset + plan.span();
++    assert_eq!(
++        plan.read_window(0x8000, bt.offset - 1),
++        Err(BufferTextureRefusal::SourceRange)
++    );
++    assert_eq!(
++        plan.read_window(u64::MAX - bt.offset, exact),
++        Err(BufferTextureRefusal::GuestAddressOverflow)
++    );
++    bt.offset = u64::MAX;
++    assert_eq!(
++        rgba16_admitted(&bt).read_window(0, u64::MAX),
++        Err(BufferTextureRefusal::OffsetOverflow)
++    );
++    bt.offset = 0;
++    bt.bytes_per_row = 3071;
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| true),
++        Err(BufferTextureRefusal::RowPitchShort)
++    );
++    bt.bytes_per_row = u64::MAX;
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| true),
++        Err(BufferTextureRefusal::RowSpanOverflow)
++    );
++    bt.bytes_per_row = 1 << 63;
++    bt.desc.height = 2;
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| true),
++        Err(BufferTextureRefusal::HostLengthOverflow)
++    );
++    bt.bytes_per_row = 0;
++    bt.desc.width = u32::MAX;
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| true),
++        Err(BufferTextureRefusal::TightRowOverflow)
++    );
++    bt.desc.width = 384;
++    bt.desc.height = 0;
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| true),
++        Err(BufferTextureRefusal::ZeroGeometry)
++    );
++}
++
++#[test]
++fn rgba16_buffer_texture_tight_default_upload_owns_all_eight_bytes() {
++    let mut bt = rgba16_descriptor();
++    bt.desc.width = 1;
++    bt.desc.height = 1;
++    bt.bytes_per_row = 0;
++    let plan = rgba16_admitted(&bt);
++    let mut source = vec![1, 0, 255, 1, 0, 128, 254, 255];
++    let (upload, format) = plan.copy_rows(&source).unwrap();
++    source.fill(0);
++    drop(source);
++    assert_eq!(plan.span(), 8);
++    assert_eq!(upload, [1, 0, 255, 1, 0, 128, 254, 255]);
++    assert_eq!(
++        format,
++        SampledByteFormat::from_source(
++            TexelLayout::Rgba16Unorm,
++            pixel_format::MTL_FORMAT_RGBA16_UNORM
++        )
++    );
++}
++
++#[test]
++fn native_buffer_texture_selector_admits_exactly_the_two_native_formats() {
++    for format in 0..=u16::MAX {
++        let mut bt = descriptor();
++        bt.desc.pixel_format = format;
++        bt.bytes_per_row = 0;
++        let mut queried = None;
++        let plan = NativeBufferTexture::resolve(&bt, |layout| {
++            queried = Some(layout);
++            true
++        })
++        .unwrap();
++        match format {
++            pixel_format::MTL_FORMAT_RGB10A2_UNORM => {
++                assert!(plan.is_some());
++                assert_eq!(queried, Some(TexelLayout::Rgb10a2Unorm));
++            }
++            pixel_format::MTL_FORMAT_RGBA16_UNORM => {
++                assert!(plan.is_some());
++                assert_eq!(queried, Some(TexelLayout::Rgba16Unorm));
++            }
++            _ => {
++                assert!(
++                    plan.is_none(),
++                    "format {format:#x} must retain its old loader"
++                );
++                assert_eq!(queried, None);
++            }
++        }
++    }
++}

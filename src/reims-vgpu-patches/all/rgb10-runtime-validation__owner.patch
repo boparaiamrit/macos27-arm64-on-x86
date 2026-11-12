@@ -1,0 +1,527 @@
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -60,6 +60,9 @@
+ use reims_vgpu_protocol::pass_action::{
+     MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_STORE,
+ };
++
++#[cfg(feature = "backend-vulkan")]
++mod buffer_texture;
+ 
+ // The Vulkan half of this path, named rather than re-exported flat — the
+ // sibling of `metal`, and gated once here rather than per item.
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -1148,6 +1148,72 @@
+     ));
+ }
+ 
++/// Opcode-9 byte uploads select their storage layout before reading the
++/// buffer. RGB10A2 has no RGBA8 alternative; host refusal is terminal for that
++/// bind. Every other format retains the existing converting loader.
++fn load_buffer_texture_upload<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    texture_ref: u32,
++    bt: &BufferTextureDescriptor,
++) -> Option<(u32, u32, Vec<u8>, SampledByteFormat)> {
++    use super::buffer_texture::NativeBufferTexture;
++
++    let refuse = |reason: super::buffer_texture::BufferTextureRefusal| {
++        crate::observe::fail(format!(
++            "buftex native_refused reason={} task={task_id} ref={texture_ref} descriptor={bt:?}",
++            reason.slug(),
++        ));
++    };
++    let plan = match NativeBufferTexture::resolve(
++        bt,
++        crate::backend::vulkan::engine::supports_sampled_layout_bind,
++    ) {
++        Ok(Some(plan)) => plan,
++        Ok(None) => {
++            let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, bt)?;
++            return Some((
++                w,
++                h,
++                rgba,
++                SampledByteFormat::from_source(TexelLayout::Rgba8, bt.desc.pixel_format),
++            ));
++        }
++        Err(reason) => {
++            refuse(reason);
++            return None;
++        }
++    };
++    // Retain both debts of the existing loader: the bound texture reference
++    // here, and the backing buffer reference in read_buffer_bytes_resolved's
++    // census/pay/settle transaction. No guest allocation is evicted or rebound.
++    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
++    let backing = resolve_buffer_backing(state, host, task_id, bt.buffer_ref, None)?;
++    if let Err(reason) = plan.read_window(backing.gva, backing.size) {
++        refuse(reason);
++        return None;
++    }
++    let raw = read_buffer_bytes_resolved(
++        state,
++        host,
++        task_id,
++        bt.buffer_ref,
++        &backing,
++        plan.offset(),
++        Some(plan.span()),
++    )?;
++    let (bytes, format) = match plan.copy_rows(&raw) {
++        Ok(upload) => upload,
++        Err(reason) => {
++            refuse(reason);
++            return None;
++        }
++    };
++    let (w, h) = plan.extent();
++    Some((w, h, bytes, format))
++}
++
+ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut M,
+@@ -1168,19 +1234,16 @@
+     if let Some(bt) =
+         buffer_texture_descriptor(state, host, task_id, texture_ref, resource.as_deref())
+     {
+-        // The opcode-9 descriptor's own pixel format. The loader converts to
+-        // RGBA8 order and decodes nothing, so the transfer function the guest
+-        // declared is still the one these bytes carry.
+-        let source = bt.desc.pixel_format;
+-        let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)?;
++        let (w, h, bytes, format) =
++            load_buffer_texture_upload(state, host, task_id, texture_ref, &bt)?;
+         return Some((
+             w,
+             h,
+             0,
+             SampledSourceRequest::Bytes(
+-                std::sync::Arc::new(rgba),
++                std::sync::Arc::new(bytes),
+                 None,
+-                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
++                format,
+                 crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
+             ),
+         ));
+--- /dev/null
++++ b/crates/reims-vgpu/src/runtime/draw/buffer_texture.rs
+@@ -0,0 +1,170 @@
++//! Native opcode-9 storage for the packed RGB10A2 format. Other formats keep
++//! their existing RGBA8 loader; ten-bit words never enter that converter.
++
++use crate::observe::Decline;
++use crate::protocol::pixel_format::{self, SampledByteFormat, TexelLayout};
++use crate::runtime::decode::resource::{BufferTextureDescriptor, TextureLevelLayout};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum BufferTextureRefusal {
++    UnsupportedShape,
++    ZeroGeometry,
++    TightRowOverflow,
++    RowPitchShort,
++    RowSpanOverflow,
++    HostLengthOverflow,
++    HostSampledLayout,
++    OffsetOverflow,
++    SourceRange,
++    GuestAddressOverflow,
++    SourceBytesShort,
++}
++
++impl Decline for BufferTextureRefusal {
++    fn slug(&self) -> &'static str {
++        match self {
++            Self::UnsupportedShape => "buftex_native_shape",
++            Self::ZeroGeometry => "buftex_native_zero_geometry",
++            Self::TightRowOverflow => "buftex_native_tight_row_overflow",
++            Self::RowPitchShort => "buftex_native_row_pitch_short",
++            Self::RowSpanOverflow => "buftex_native_row_span_overflow",
++            Self::HostLengthOverflow => "buftex_native_host_length_overflow",
++            Self::HostSampledLayout => "buftex_native_host_sampled_layout",
++            Self::OffsetOverflow => "buftex_native_offset_overflow",
++            Self::SourceRange => "buftex_native_source_range",
++            Self::GuestAddressOverflow => "buftex_native_guest_address_overflow",
++            Self::SourceBytesShort => "buftex_native_source_bytes_short",
++        }
++    }
++}
++
++/// A native upload whose source geometry and host sampled-format capability
++/// have both been established. Guest storage is still read by the runtime's
++/// existing debt-paying, settling buffer reader, never by this value.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) struct NativeBufferTexture {
++    level: TextureLevelLayout,
++}
++
++impl NativeBufferTexture {
++    /// `None` means this format stays on its existing loader. Once RGB10A2 has
++    /// selected this owner, an unsupported shape or host is a refusal, never
++    /// permission to quantize the words or reinterpret them as RGBA8.
++    pub(super) fn resolve(
++        bt: &BufferTextureDescriptor,
++        supports_sampled_layout: impl FnOnce(TexelLayout) -> bool,
++    ) -> Result<Option<Self>, BufferTextureRefusal> {
++        use BufferTextureRefusal as R;
++        if bt.desc.pixel_format != pixel_format::MTL_FORMAT_RGB10A2_UNORM {
++            return Ok(None);
++        }
++        let d = &bt.desc;
++        // SampledSourceRequest's byte source carries one 2D image. Do not
++        // invent missing planes, mips, multisamples, or a descriptor swizzle.
++        if d.texture_type != 2
++            || d.depth != 1
++            || d.array_length != 1
++            || d.sample_count != 1
++            || d.mipmap_level_count != 1
++            || d.swizzle.is_some()
++        {
++            return Err(R::UnsupportedShape);
++        }
++        if d.width == 0 || d.height == 0 {
++            return Err(R::ZeroGeometry);
++        }
++        let tight = TexelLayout::Rgb10a2Unorm
++            .tight_row_bytes(d.width)
++            .ok_or(R::TightRowOverflow)?;
++        let pitch = if bt.bytes_per_row == 0 {
++            u64::from(tight)
++        } else {
++            bt.bytes_per_row
++        };
++        if pitch < u64::from(tight) {
++            return Err(R::RowPitchShort);
++        }
++        let mut level = TextureLevelLayout {
++            offset: bt.offset,
++            row_stride: pitch,
++            width: d.width,
++            height: d.height,
++            depth: 1,
++            ..Default::default()
++        };
++        // The existing geometry owner excludes padding after the last row.
++        level.size = level.read_span(tight).ok_or(R::RowSpanOverflow)?;
++        super::host_alloc_len(level.size).ok_or(R::HostLengthOverflow)?;
++        super::host_alloc_len(u64::from(tight) * u64::from(d.height))
++            .ok_or(R::HostLengthOverflow)?;
++        if !supports_sampled_layout(TexelLayout::Rgb10a2Unorm) {
++            return Err(R::HostSampledLayout);
++        }
++        Ok(Some(Self { level }))
++    }
++
++    pub(super) fn extent(self) -> (u32, u32) {
++        (self.level.width, self.level.height)
++    }
++
++    pub(super) fn offset(self) -> u64 {
++        self.level.offset
++    }
++
++    pub(super) fn span(self) -> u64 {
++        self.level.size
++    }
++
++    /// Validate the texture's complete read against the buffer allocation and
++    /// the address space before the runtime allocates or reads any guest bytes.
++    pub(super) fn read_window(
++        self,
++        buffer_gva: u64,
++        buffer_size: u64,
++    ) -> Result<(u64, u64), BufferTextureRefusal> {
++        use BufferTextureRefusal as R;
++        let end = self
++            .offset()
++            .checked_add(self.span())
++            .ok_or(R::OffsetOverflow)?;
++        if end > buffer_size {
++            return Err(R::SourceRange);
++        }
++        buffer_gva.checked_add(end).ok_or(R::GuestAddressOverflow)?;
++        // The checked end includes a nonempty span, so the start cannot wrap.
++        Ok((buffer_gva + self.offset(), self.span()))
++    }
++
++    /// `raw` begins at the validated buffer offset. The result owns its bytes
++    /// independently of the guest allocation and excludes every padding byte.
++    pub(super) fn copy_rows(
++        self,
++        raw: &[u8],
++    ) -> Result<(Vec<u8>, SampledByteFormat), BufferTextureRefusal> {
++        use BufferTextureRefusal as R;
++        if (raw.len() as u64) < self.span() {
++            return Err(R::SourceBytesShort);
++        }
++        // Construction checked these widths and lengths and the value is
++        // private, so no unchecked external geometry can reach this gather.
++        let row = TexelLayout::Rgb10a2Unorm
++            .tight_row_bytes(self.level.width)
++            .unwrap() as usize;
++        let mut bytes = vec![0; row * self.level.height as usize];
++        for y in 0..self.level.height as usize {
++            let src = y * self.level.row_stride as usize;
++            bytes[y * row..(y + 1) * row].copy_from_slice(&raw[src..src + row]);
++        }
++        Ok((
++            bytes,
++            SampledByteFormat::from_source(
++                TexelLayout::Rgb10a2Unorm,
++                pixel_format::MTL_FORMAT_RGB10A2_UNORM,
++            ),
++        ))
++    }
++}
++
++#[cfg(test)]
++#[path = "buffer_texture_tests.rs"]
++mod tests;
+--- /dev/null
++++ b/crates/reims-vgpu/src/runtime/draw/buffer_texture_tests.rs
+@@ -0,0 +1,240 @@
++use super::*;
++use crate::runtime::heap_query::TextureDescriptor;
++
++fn descriptor() -> BufferTextureDescriptor {
++    BufferTextureDescriptor {
++        new_texture_ref: 31,
++        buffer_ref: 32,
++        offset: 64,
++        bytes_per_row: 512,
++        desc: TextureDescriptor {
++            texture_type: 2,
++            framebuffer_only: false,
++            is_drawable: false,
++            allow_gpu_optimized_contents: false,
++            usage: 1,
++            pixel_format: pixel_format::MTL_FORMAT_RGB10A2_UNORM,
++            width: 106,
++            height: 106,
++            depth: 1,
++            mipmap_level_count: 1,
++            sample_count: 1,
++            array_length: 1,
++            resource_options: 0,
++            protection_options: 0,
++            swizzle: None,
++        },
++    }
++}
++
++fn admitted(bt: &BufferTextureDescriptor) -> NativeBufferTexture {
++    NativeBufferTexture::resolve(bt, |layout| {
++        assert_eq!(layout, TexelLayout::Rgb10a2Unorm);
++        true
++    })
++    .unwrap()
++    .expect("native ten-bit plan")
++}
++
++#[test]
++fn rgb10_buffer_texture_preserves_native_words_at_106_width_and_512_pitch() {
++    let bt = descriptor();
++    let plan = admitted(&bt);
++    let words: [u32; 3] = [
++        1 | (513 << 10) | (1022 << 20) | (3 << 30),
++        2 | (513 << 10) | (1022 << 20) | (3 << 30),
++        1023 | (1 << 10) | (512 << 20) | (1 << 30),
++    ];
++    // Red values 1 and 2 are distinct in ten bits and both round to zero in
++    // eight. An RGBA8 intermediate therefore cannot satisfy this oracle.
++    let mut raw = vec![0xacu8; 512 * 106];
++    for y in 0..106 {
++        for x in 0..106 {
++            raw[y * 512 + x * 4..y * 512 + x * 4 + 4]
++                .copy_from_slice(&words[(y + x) % 3].to_le_bytes());
++        }
++    }
++    let (bytes, format) = plan.copy_rows(&raw).unwrap();
++    assert_eq!(plan.extent(), (106, 106));
++    assert_eq!(
++        format,
++        SampledByteFormat::from_source(TexelLayout::Rgb10a2Unorm, bt.desc.pixel_format)
++    );
++    assert_eq!(bytes.len(), 106 * 106 * 4);
++    for y in 0..106 {
++        assert_eq!(&bytes[y * 424..(y + 1) * 424], &raw[y * 512..y * 512 + 424]);
++    }
++    assert_ne!(&bytes[0..4], &bytes[4..8]);
++}
++
++#[test]
++fn native_buffer_texture_needs_no_trailing_row_padding() {
++    let plan = admitted(&descriptor());
++    let exact = 105 * 512 + 424;
++    let raw = vec![0x5bu8; exact];
++    assert_eq!(plan.span(), exact as u64);
++    assert!(plan.copy_rows(&raw).is_ok());
++    assert_eq!(
++        plan.copy_rows(&raw[..exact - 1]),
++        Err(BufferTextureRefusal::SourceBytesShort)
++    );
++}
++
++#[test]
++fn native_buffer_texture_offset_is_bounded_by_the_source_allocation() {
++    let bt = descriptor();
++    let plan = admitted(&bt);
++    let exact = bt.offset + plan.span();
++    assert_eq!(plan.read_window(0x8000, exact), Ok((0x8040, plan.span())));
++    assert_eq!(
++        plan.read_window(0x8000, exact - 1),
++        Err(BufferTextureRefusal::SourceRange)
++    );
++    assert_eq!(
++        plan.read_window(0x8000, bt.offset - 1),
++        Err(BufferTextureRefusal::SourceRange)
++    );
++    assert_eq!(
++        plan.read_window(u64::MAX - bt.offset, exact),
++        Err(BufferTextureRefusal::GuestAddressOverflow)
++    );
++}
++
++#[test]
++fn native_buffer_texture_checks_offset_and_row_span_overflow() {
++    let mut bt = descriptor();
++    bt.offset = u64::MAX;
++    assert_eq!(
++        admitted(&bt).read_window(0, u64::MAX),
++        Err(BufferTextureRefusal::OffsetOverflow)
++    );
++    bt.offset = 0;
++    bt.bytes_per_row = u64::MAX;
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| true),
++        Err(BufferTextureRefusal::RowSpanOverflow)
++    );
++    bt.bytes_per_row = 423;
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| true),
++        Err(BufferTextureRefusal::RowPitchShort)
++    );
++    bt.bytes_per_row = 1 << 63;
++    bt.desc.height = 2;
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| true),
++        Err(BufferTextureRefusal::HostLengthOverflow)
++    );
++    bt.bytes_per_row = 0;
++    bt.desc.width = u32::MAX;
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| true),
++        Err(BufferTextureRefusal::TightRowOverflow)
++    );
++}
++
++#[test]
++fn native_buffer_texture_tight_default_keeps_the_word_bytes() {
++    let mut bt = descriptor();
++    bt.bytes_per_row = 0;
++    bt.desc.width = 2;
++    bt.desc.height = 1;
++    let plan = admitted(&bt);
++    let raw = [1, 4, 16, 64, 2, 8, 32, 128];
++    assert_eq!(plan.span(), 8);
++    assert_eq!(plan.copy_rows(&raw).unwrap().0, raw);
++}
++
++#[test]
++fn native_buffer_texture_refuses_an_unsupported_host_instead_of_converting() {
++    let bt = descriptor();
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| false),
++        Err(BufferTextureRefusal::HostSampledLayout)
++    );
++}
++
++#[test]
++fn native_buffer_texture_leaves_every_other_format_on_its_existing_route() {
++    for format in [
++        0,
++        pixel_format::MTL_FORMAT_RGBA8_UNORM,
++        pixel_format::MTL_FORMAT_BGRA8_UNORM,
++        pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
++        pixel_format::MTL_FORMAT_BGR10A2_UNORM,
++        0xffff,
++    ] {
++        let mut bt = descriptor();
++        bt.desc.pixel_format = format;
++        assert_eq!(
++            NativeBufferTexture::resolve(&bt, |_| panic!("no host query for {format:#x}")),
++            Ok(None)
++        );
++    }
++}
++
++#[test]
++fn native_buffer_texture_refuses_shapes_the_2d_request_cannot_express() {
++    for select in 0..6 {
++        let mut bt = descriptor();
++        match select {
++            0 => bt.desc.texture_type = 3,
++            1 => bt.desc.depth = 2,
++            2 => bt.desc.array_length = 2,
++            3 => bt.desc.sample_count = 4,
++            4 => bt.desc.mipmap_level_count = 2,
++            5 => bt.desc.swizzle = Some([2, 1, 0, 3]),
++            _ => unreachable!(),
++        }
++        assert_eq!(
++            NativeBufferTexture::resolve(&bt, |_| panic!("shape refused before host query")),
++            Err(BufferTextureRefusal::UnsupportedShape)
++        );
++    }
++    let mut bt = descriptor();
++    bt.desc.width = 0;
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| true),
++        Err(BufferTextureRefusal::ZeroGeometry)
++    );
++    bt.desc.width = 106;
++    bt.desc.height = 0;
++    assert_eq!(
++        NativeBufferTexture::resolve(&bt, |_| true),
++        Err(BufferTextureRefusal::ZeroGeometry)
++    );
++}
++
++#[test]
++fn native_buffer_texture_copy_owns_its_bytes_after_source_release() {
++    let mut bt = descriptor();
++    bt.bytes_per_row = 0;
++    bt.desc.width = 1;
++    bt.desc.height = 1;
++    let plan = admitted(&bt);
++    let mut raw = vec![1, 2, 3, 4];
++    let (upload, _) = plan.copy_rows(&raw).unwrap();
++    raw.fill(0);
++    drop(raw);
++    assert_eq!(upload, [1, 2, 3, 4]);
++}
++
++#[test]
++fn every_native_buffer_texture_refusal_has_a_distinct_slug() {
++    use crate::observe::Decline;
++    let refusals = [
++        BufferTextureRefusal::UnsupportedShape,
++        BufferTextureRefusal::ZeroGeometry,
++        BufferTextureRefusal::TightRowOverflow,
++        BufferTextureRefusal::RowPitchShort,
++        BufferTextureRefusal::RowSpanOverflow,
++        BufferTextureRefusal::HostLengthOverflow,
++        BufferTextureRefusal::HostSampledLayout,
++        BufferTextureRefusal::OffsetOverflow,
++        BufferTextureRefusal::SourceRange,
++        BufferTextureRefusal::GuestAddressOverflow,
++        BufferTextureRefusal::SourceBytesShort,
++    ];
++    let names: std::collections::HashSet<_> = refusals.iter().map(Decline::slug).collect();
++    assert_eq!(names.len(), refusals.len());
++}

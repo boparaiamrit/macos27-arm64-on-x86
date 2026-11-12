@@ -1,0 +1,72 @@
+--- production/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
++++ instrumented/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
+@@ -1250,6 +1250,16 @@
+         if features.wants_extended_dynamic_state3() {
+             dci = dci.push_next(&mut en_extended_dynamic_state3);
+         }
++        let mut chain = dci.p_next.cast::<vk::BaseInStructure<'_>>();
++        let mut enabled_order = None;
++        while !chain.is_null() {
++            if (*chain).s_type == vk::StructureType::PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT {
++                let actual = &*chain.cast::<vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT<'_>>();
++                enabled_order = Some((actual.rasterization_order_color_attachment_access, actual.rasterization_order_depth_attachment_access, actual.rasterization_order_stencil_attachment_access));
++            }
++            chain = (*chain).p_next;
++        }
++        eprintln!("MRT_ORDER_DEVICE queried={} actual_device_chain={enabled_order:?} extension_selected={}", features.ordered_color_attachment_access, enabled_device_extensions.contains(&vk::EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_NAME.as_ptr()));
+         let device = instance
+             .create_device(pd, &dci, None)
+             .map_err(|result| DrawError::Init(InitDecline::CreateDevice { result }))?;
+--- production/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
++++ instrumented/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+@@ -2312,6 +2312,16 @@
+             deps.push(fetch_dep);
+         }
+         deps.push(color_feedback_self_dependency(key.color_layout(0)));
++        if !key.color_input.is_empty() {
++            eprintln!(
++                "MRT_ORDER_PASS flags={} refs={:?}",
++                subpass[0].flags.as_raw(),
++                input_ref
++                    .iter()
++                    .map(|r| (r.attachment, r.layout.as_raw()))
++                    .collect::<Vec<_>>()
++            );
++        }
+         let rp_info = vk::RenderPassCreateInfo::default()
+             .attachments(&attachments)
+             .subpasses(&subpass)
+@@ -2843,6 +2853,9 @@
+         // byte-identical to the pre-depth engine. The reference field is left 0
+         // here and supplied dynamically per draw, and on a dynamic host so is
+         // everything else — see the key's own doc.
++        if !key.pass.0.color_input.is_empty() {
++            eprintln!("MRT_ORDER_BLEND flags={}", blend.flags.as_raw());
++        }
+         let depth_stencil = key.depth_stencil.native();
+         let mut gpci = vk::GraphicsPipelineCreateInfo::default()
+             .stages(&stages)
+--- production/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ instrumented/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -6233,6 +6233,13 @@
+         }
+     }));
+     for &(input, view, layout) in color_input {
++        eprintln!(
++            "MRT_ORDER_DESCRIPTOR input={} binding={} view={:?} layout={:?}",
++            input.get(),
++            super::types::COLOR_INPUT_BINDING + input.get() as u32,
++            view,
++            layout
++        );
+         out.push(super::pools::PushDescriptorBinding::Image {
+             binding: super::types::COLOR_INPUT_BINDING + input.get() as u32,
+             array_element: 0,
+--- production/crates/reims-vgpu/tests/vk_engine_parity.rs
++++ instrumented/crates/reims-vgpu/tests/vk_engine_parity.rs
+@@ -4349,3 +4349,5 @@
+         "a draw since the stamp clears it — the slot is still there"
+     );
+ }
++
++include!("mrt_order_gpu.rs");

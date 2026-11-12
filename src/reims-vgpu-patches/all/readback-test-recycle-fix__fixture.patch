@@ -1,0 +1,16 @@
+--- before/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
++++ fixed/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
+@@ -4331,8 +4331,13 @@
+         assert_ne!(
+             other.buffer, slot.buffer,
+             "the leased slot was handed out again under a live borrow"
+         );
++        // `acquire_readback` makes its result the primary live slot, replacing
++        // whatever was live, so a slot acquired without a recycle is dropped from
++        // every owner and never freed. The pool contract is recycle between
++        // acquires (`acquire_readback_extra` is the call that keeps the primary).
++        pools.recycle_readback();
+ 
+         return_readback_lease(token);
+         assert_eq!(
+             readback_leases_outstanding(),

@@ -1,0 +1,232 @@
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/color_input.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/color_input.rs
+@@ -161,3 +161,19 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod parent_review_span_tests {
++    use super::*;
++    #[test]
++    fn parent_review_sparse_input_table_obeys_stage_span_limit() {
++        let caps = DeviceFeatures {
++            ordered_color_attachment_access: true,
++            max_color_attachments: 8,
++            input_attachment_descriptor_limit: 4,
++            ..Default::default()
++        };
++        assert!(OrderedColorInputs::admit(ColorInputs::parse([7]).unwrap(), &caps, 8).is_err(),
++                "one descriptor still requires eight input-reference table entries");
++    }
++}
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+@@ -641,6 +641,10 @@
+         key.host_accessible_color0 = false;
+         key.feedback_colors = 0;
+         FramebufferCompatibilityKey(key)
++    }
++
++    pub(crate) fn primary_load_ops(self) -> (vk::AttachmentLoadOp, vk::ImageLayout) {
++        self.color0_load.ops(self.color_final_layout(0))
+     }
+ 
+     pub(crate) fn color_input_references(self) -> Vec<vk::AttachmentReference> {
+@@ -2149,7 +2153,7 @@
+         // second spelling here would make that skip a missing transition the
+         // first time somebody changed one of them.
+         let color0_final = key.color_final_layout(0);
+-        let (load_op, initial) = key.color0_load.ops(color0_final);
++        let (load_op, initial) = key.primary_load_ops();
+         // Slot 0 (primary) and the secondary attachments (slot 1..) now exit the
+         // same way, at [`color0_pass_exit_layout`], and for the same reason: a
+         // consumer's barrier is what establishes the dependency, so leaving the
+@@ -4580,3 +4584,15 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod parent_review_primary_load_tests {
++    use super::*;
++    #[test]
++    fn parent_review_primary_load_names_the_recorded_entry_layout() {
++        let mut key = PassKey::single(Color0Load::Preserve, vk::Format::R8G8B8A8_UNORM);
++        key.color_input = super::super::color_input::OrderedColorInputs::fixture(&[0]);
++        assert_eq!(key.color_final_layout(0), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, "requires COLOR_GENERAL=off");
++        assert_eq!(key.primary_load_ops(), (vk::AttachmentLoadOp::LOAD, key.color_layout(0)));
++    }
++}
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -4632,11 +4632,10 @@
+         );
+     } else if load_uses_gpu_content
+         && !(target_feedback && req.continues_render_pass && pools.open_pass_echoes(&echo))
+-        && !pass_exit_needs_no_barrier(target_prior_access(
+-            target_snapshotted,
+-            target_access,
+-            target_guest_backed,
+-        ))
++        && !pass_exit_needs_no_barrier(
++            target_prior_access(target_snapshotted, target_access, target_guest_backed),
++            target_pass_layout,
++        )
+     {
+         unsafe { outside_pass.before_record(PassObstacle::TargetLayout, pools, &ctx.device, cb) };
+         // A prior direct sample may have left this target shader-readable, or a
+@@ -5455,15 +5454,7 @@
+         // write-after-write dependency and nothing else. What separates the arms
+         // is the pass instance alone. Use `REIMS_VGPU_LAYOUT_CHURN` to price a
+         // transition; that is now the only arm that has one.
+-        let back = [vk::ImageMemoryBarrier::default()
+-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+-            .dst_access_mask(
+-                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+-            )
+-            .old_layout(target_pass_layout)
+-            .new_layout(target_pass_layout)
+-            .image(target_image)
+-            .subresource_range(super::color_subresource_range())];
++        let back = primary_pass_restart_barrier(pass_key, target_image);
+         ctx.device.cmd_pipeline_barrier(
+             cb,
+             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+@@ -5555,13 +5546,9 @@
+         // explicit, and it is put back afterwards so that
+         // `registry_mark_ready_at`'s claim about this resident stays true — that
+         // call runs below and records the pass's exit layout unconditionally.
+-        let to_transfer = [vk::ImageMemoryBarrier::default()
+-            .src_access_mask(target_dst_access)
+-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+-            .old_layout(target_pass_layout)
+-            .new_layout(target_read_layout)
+-            .image(target_image)
+-            .subresource_range(super::color_subresource_range())];
++        let (to_transfer, back_to_exit) = primary_readback_barriers(
++            pass_key, target_read_layout, target_image, target_dst_access,
++        );
+         ctx.device.cmd_pipeline_barrier(
+             cb,
+             target_dst_stage,
+@@ -5585,13 +5572,6 @@
+             rb.buffer,
+             &region,
+         );
+-        let back_to_exit = [vk::ImageMemoryBarrier::default()
+-            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+-            .dst_access_mask(target_dst_access)
+-            .old_layout(target_read_layout)
+-            .new_layout(target_pass_layout)
+-            .image(target_image)
+-            .subresource_range(super::color_subresource_range())];
+         ctx.device.cmd_pipeline_barrier(
+             cb,
+             vk::PipelineStageFlags::TRANSFER,
+@@ -6463,7 +6443,48 @@
+ /// removes the `vkCmdPipelineBarrier` that was left recording nothing. The
+ /// counter follows honestly — a draw that records no barrier is not charged an
+ /// obstacle, so `passmerge_reachable` can be non-zero for the first time.
+-fn pass_exit_needs_no_barrier(prior: super::pools::ResidentAccess) -> bool {
++fn primary_readback_barriers(
++    key: super::caches::PassKey,
++    target_read_layout: vk::ImageLayout,
++    target_image: vk::Image,
++    target_dst_access: vk::AccessFlags,
++) -> ([vk::ImageMemoryBarrier<'static>; 1], [vk::ImageMemoryBarrier<'static>; 1]) {
++    let target_pass_layout = key.color_layout(0);
++    let to_transfer = [vk::ImageMemoryBarrier::default()
++        .src_access_mask(target_dst_access)
++        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
++        .old_layout(target_pass_layout)
++        .new_layout(target_read_layout)
++        .image(target_image)
++        .subresource_range(super::color_subresource_range())];
++    let back_to_exit = [vk::ImageMemoryBarrier::default()
++        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
++        .dst_access_mask(target_dst_access)
++        .old_layout(target_read_layout)
++        .new_layout(target_pass_layout)
++        .image(target_image)
++        .subresource_range(super::color_subresource_range())];
++    (to_transfer, back_to_exit)
++}
++
++fn primary_pass_restart_barrier(
++    key: super::caches::PassKey,
++    target_image: vk::Image,
++) -> [vk::ImageMemoryBarrier<'static>; 1] {
++    let target_pass_layout = key.color_layout(0);
++    let back = [vk::ImageMemoryBarrier::default()
++        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
++        .dst_access_mask(
++        vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
++        )
++        .old_layout(target_pass_layout)
++        .new_layout(target_pass_layout)
++        .image(target_image)
++        .subresource_range(super::color_subresource_range())];
++    back
++}
++
++fn pass_exit_needs_no_barrier(prior: super::pools::ResidentAccess, _next_layout: vk::ImageLayout) -> bool {
+     prior == super::pools::ResidentAccess::ColorWrite(super::caches::color0_pass_exit_layout())
+ }
+ 
+@@ -8029,14 +8050,14 @@
+             let skippable = tracked
+                 == ResidentAccess::ColorWrite(super::super::caches::color0_pass_exit_layout());
+             assert_eq!(
+-                pass_exit_needs_no_barrier(tracked),
++                pass_exit_needs_no_barrier(tracked, super::super::caches::color0_pass_exit_layout()),
+                 skippable,
+                 "{tracked:?}"
+             );
+             // A snapshot is this draw's own transfer read and always needs the
+             // transition back, whatever the registry was tracking.
+             assert!(
+-                !pass_exit_needs_no_barrier(target_prior_access(true, tracked, false)),
++                !pass_exit_needs_no_barrier(target_prior_access(true, tracked, false), super::super::caches::color0_pass_exit_layout()),
+                 "a snapshotted {tracked:?} target still has to come back from TRANSFER_SRC"
+             );
+         }
+@@ -8665,3 +8686,38 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod parent_review_primary_layout_tests {
++    use super::*;
++    fn selected_key() -> super::super::caches::PassKey {
++        let mut key = super::super::caches::PassKey::single(
++            super::super::caches::Color0Load::Preserve, vk::Format::R8G8B8A8_UNORM);
++        key.color_input = super::super::color_input::OrderedColorInputs::fixture(&[0]);
++        assert_eq!(key.color_final_layout(0), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, "requires COLOR_GENERAL=off");
++        key
++    }
++    #[test]
++    fn parent_review_readback_starts_and_restores_the_actual_pass_exit() {
++        let key = selected_key();
++        let (to, back) = primary_readback_barriers(key, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
++            vk::Image::null(), vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
++        assert_eq!(to[0].old_layout, key.color_final_layout(0));
++        assert_eq!(back[0].new_layout, key.color_final_layout(0));
++        assert_eq!(to[0].new_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
++        assert_eq!(back[0].old_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
++    }
++    #[test]
++    fn parent_review_ready_primary_transitions_when_next_pass_layout_differs() {
++        let key = selected_key();
++        assert!(!pass_exit_needs_no_barrier(
++            super::super::pools::ResidentAccess::ColorWrite(key.color_final_layout(0)), key.color_layout(0)));
++    }
++    #[test]
++    fn parent_review_empty_restart_uses_final_to_entry_transition() {
++        let key = selected_key();
++        let barrier = primary_pass_restart_barrier(key, vk::Image::null());
++        assert_eq!(barrier[0].old_layout, key.color_final_layout(0));
++        assert_eq!(barrier[0].new_layout, key.color_layout(0));
++    }
++}

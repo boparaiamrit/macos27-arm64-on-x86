@@ -1,0 +1,36 @@
+--- /out/vmapple.before.c	2026-10-27 17:57:10.066696700 +0000
++++ /work/orchard-golden-scratch/qemu/hw/vmapple/vmapple.c	2026-10-27 18:02:00.014491256 +0000
+@@ -72,6 +72,7 @@
+     Notifier powerdown_notifier;
+     PCIBus *bus;
+     MemoryRegion fw_mr;
++    MemoryRegion golden_boot_scratch;
+     MemoryRegion ecam_alias;
+     uint64_t uuid;
+ 
+@@ -550,6 +551,7 @@
+     VMAppleMachineState *vms = opaque;
+ 
+     vmapple_hvc_reset();
++    memset(memory_region_get_ram_ptr(&vms->golden_boot_scratch), 0, 0x4000);
+ 
+     cpu_set_pc(first_cpu, vms->memmap[VMAPPLE_FIRMWARE].base);
+ }
+@@ -653,6 +655,17 @@
+ 
+     create_cfg(vms, sysmem, &error_fatal);
+ 
++    /* Experimental Golden 26A428 boot scratch, observed in iBootStage2.
++     * It writes a call-record pointer to 0x4ffff8 before entering XNU.
++     * Keep the existing 64 KiB configuration region unchanged; supply only
++     * the separately observed 16 KiB window, with ordinary RAM semantics.
++     * No host service or successful response is synthesized here.
++     */
++    memory_region_init_ram(&vms->golden_boot_scratch, NULL,
++                           "Golden boot scratch", 0x4000, &error_fatal);
++    memory_region_add_subregion(sysmem, 0x4fc000,
++                                &vms->golden_boot_scratch);
++
+     /* connect powerdown request */
+     vms->powerdown_notifier.notify = vmapple_powerdown_req;
+     qemu_register_powerdown_notifier(&vms->powerdown_notifier);
